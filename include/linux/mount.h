@@ -69,7 +69,7 @@ struct vfsmount {
 	struct super_block *mnt_sb;	/* pointer to superblock */
 	int mnt_flags;
 	void *data;
-#ifdef CONFIG_KSU_SUSFS
+#if 0 /* CONFIG_KSU_SUSFS - removed: layout shift breaks vendor module ABI (wifi) */
 	u64 susfs_mnt_id_backup;
 #endif
 } __randomize_layout;
