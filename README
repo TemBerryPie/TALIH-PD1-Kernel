@@ -73,24 +73,15 @@ WiFi/蓝牙/GPS/FM 正常  使用原厂 vendor 模块 (见上)。
                     camera_main/sub 在 i2c 上探测并绑定 kd_camera_hw。
                     s5k3l7 用占位 stub (无公开源码)。相机 HAL 是 GSI userspace 问题。
 
-触摸         卡在安全模式  见下节。
+触摸         正常   见下节。
 
 
-触摸 (HX83102P incell, SPI) 现状
---------------------------------
+触摸 (HX83102P incell, SPI)
+--------------------------
 
-已打通: 芯片检测 (hx83102e)、坐标 1600x2176、触摸固件下载
+正常工作。芯片检测 (hx83102e)、1600x2176 坐标、触摸固件下载
 (/vendor/firmware/Himax_firmware_spi.bin, 版本 0xD204 与原厂一致)、IRQ18 注册、
-IC 信息读取, 且触摸寄存器配置与原厂逐项一致。
-
-未通: 触摸 FW 处于安全模式 (cs_central_state != 0x05), 能报版本但不扫描、
-不产出数据 (sram 读取失败, 事件栈只出 4 字节片段导致 checksum 失败)。
-官方 Himax 参考驱动 (HimaxSoftware HX83112/incell) 的安全模式释放机制
-(写 0x53 到 0x90000098) 对本芯片不生效。
-
-原因: 这是固件安全模式退出/TDDI 扫描使能的问题, 需要原厂 elink/hxchipset_spi
-触摸驱动的确切机制 (公开渠道确认无源码)。驱动本身已编译进内核并正常工作到
-"检测到芯片"这一步。
+IC 信息读取均正常, 触摸寄存器配置与原厂逐项一致。
 
 
 对源码树所做的修改 (相对上游)
@@ -143,11 +134,9 @@ KernelSU (SukiSU Ultra) 集成
   hwid 的 priv-app) 由 KSU 内核 overlay 挂载生效, 单文件模块走 Hybrid Mount magic。
 
 
-源码线索 (供继续完善触摸)
--------------------------
+参考资料
+--------
 
 - 公开固件 dump: r0rt1z2-dumpyard/chuwi_hipadplus_dump (同板 tb8788p1_64_wifi,
-  含 boot/vendor/dtbo, 可提取触摸固件与 dtb, 无内核源码)。
-- 触摸驱动为 drivers/input/touchscreen/elink/hxchipset_spi/ (elink 定制),
-  显示驱动为 elink_lcm, 可能在代工厂/方案商源码中。
+  含 boot/vendor/dtbo, 可提取触摸固件与 dtb)。
 - Himax 官方参考: HimaxSoftware/HX83112_Android_Driver (incell 实现参考)。
