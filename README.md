@@ -9,19 +9,24 @@
 
 ---
 
-## 一、构建
+## 一、构建 (GitHub Actions)
 
 ```bash
-cd kernel/mt6771-tb8788p1
-./build.sh              # 全量构建 Image + dtb (defconfig 自动生成)
-./build.sh defconfig    # 仅重新生成 .config
-./build.sh clean        # 清理产物
+git push origin main        # push 即触发构建
+# 或网页: Actions → build-kernel → Run workflow
 ```
 
-工具链要求 `toolchain/linux-x86/clang-r383902` 位于 `kernel/` 的上级目录
-(或用环境变量 `CLANG_R383902_DIR` 指定)。
+产物: Actions 页 `build-kernel` run 的 **artifact `Image-TALIH-PD1`** (arch/arm64/boot/Image)。
 
-产物: `arch/arm64/boot/Image` (≈25MB, 与原厂 25.8MB 相当), `arch/arm64/boot/dts/mediatek/mt6771.dtb`。
+本地构建 (需 clang r383902 + gcc-aarch64-linux-gnu):
+
+```bash
+export PATH="<toolchain>/clang-r383902b/bin:$PATH"
+make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j10 Image dtbs
+# KBUILD_KCONFIG 需指向 arch/arm64/Kconfig (MTK 惯例, 顶层无 Kconfig)
+```
+
+产物: `arch/arm64/boot/Image` (≈25MB), `arch/arm64/boot/dts/mediatek/mt6771.dtb`。
 
 ## 二、打包 boot.img 并刷入
 
@@ -98,8 +103,25 @@ IC 信息读取, 且**触摸寄存器配置与原厂逐项一致**。
   显示驱动为 `elink_lcm`, 可能在代工厂/方案商源码中。
 - Himax 官方参考: `HimaxSoftware/HX83112_Android_Driver` (incell 实现参考)。
 
-## 八、已知次要问题
+## 八、KernelSU (SukiSU Ultra) 集成
+
+- 驱动: **SukiSU Ultra main (driver 40877)**, 4.14 全面适配
+  (LSM/patch_memory/selinux/file_wrapper/fsnotify 等 compat + path_mount/path_umount backport)
+- **SUSFS v2.2.0** (gki-6.12 特性集移植): sus_map / avc_log_spoofing / sus_path_loop /
+  hide_sus_mnts / sdcard_monitor / enabled_features; CMD dispatch 经 reboot SUSFS_MAGIC
+- 4.14 关键适配: MTK el0_svc 直接 blr (syscall 表参数版) → `ksu_syscall_table_call()` wrapper;
+  4.14 无 seccomp action-cache → `disable_seccomp()` 路径; `CONFIG_FTRACE_SYSCALLS=y` 必须开;
+  reboot/input kprobe handler 用直接参数
+- Manager 显示 `v4.1.3-TALIH-PD1@Fumor` (KSU_VERSION_FULL 在 Kbuild 写死)
+
+## 九、已知次要问题
 
 - `hx83102p_fhdp_dsi_vdo_boe` platform driver 名在两个面板拷贝中重复
   (第二次注册 abort, 不影响 hx83102p 主面板)。
 - s5k3l7 相机传感器无公开源码 (占位 stub), 设备若装配的是 s5k3l6 则相机可用。
+- **WiFi/蓝牙 (二分进行中)**: 原厂 boot 下正常; 本内核下 TEE 报 BTA TA "No such object
+  found" (93feffcc...) + activation data len 0, 蓝牙 HciHalHidl 启动失败。当前在
+  SUSFS on/off 二分定位 (Actions 默认构建为 SUSFS-off 测试配置)。
+- 元模块 (Hybrid Mount/mountify/meta-overlayfs) 与 GSI 兼容性差: overlay 依赖
+  /system/bin symlink (GSI 为真目录) 或 5.x 内核 API; 固化类模块建议 magic bind
+  或合并进稳定模块 (hwid) 的 workaround。
