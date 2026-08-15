@@ -50,7 +50,7 @@ jobs:
           export PATH="/opt/clang/bin:$PATH"
           export CCACHE_DIR=$HOME/.ccache
           export CCACHE_COMPILERCHECK=content
-          make ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image dtbs
+          make ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) -k Image dtbs
 
       - name: Upload Image
         uses: actions/upload-artifact@v4

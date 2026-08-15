@@ -1203,6 +1203,7 @@ out_copy_to_user:
 
 /* ---- v2.2.0 new-style API wrappers over the 4.14 implementations ---- */
 
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
 void susfs_add_sus_path_new(void __user **user_info) {
 	struct st_susfs_sus_path info = {0};
 	int ret;
@@ -1219,7 +1220,9 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_ADD_SUS_PATH -> ret: %d\n", info.err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 void susfs_add_sus_kstat_new(void __user **user_info) {
 	struct st_susfs_sus_kstat info = {0};
 	int ret;
@@ -1236,7 +1239,9 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_ADD_SUS_KSTAT -> ret: %d\n", info.err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 void susfs_update_sus_kstat_new(void __user **user_info) {
 	struct st_susfs_sus_kstat info = {0};
 	int ret;
@@ -1253,7 +1258,9 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_UPDATE_SUS_KSTAT -> ret: %d\n", info.err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 void susfs_set_uname_new(void __user **user_info) {
 	struct st_susfs_uname info = {0};
 	int ret;
@@ -1270,11 +1277,15 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_SET_UNAME -> ret: %d\n", info.err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 void susfs_enable_log(void __user **user_info) {
 	susfs_set_log(true);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
 void susfs_set_cmdline_or_bootconfig_new(void __user **user_info) {
 	char *fake = NULL;
 	int err = -EFAULT;
@@ -1298,7 +1309,9 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG -> ret: %d\n", err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
 
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 void susfs_add_open_redirect_new(void __user **user_info) {
 	struct st_susfs_open_redirect info = {0};
 	int ret;
@@ -1315,7 +1328,9 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_ADD_OPEN_REDIRECT -> ret: %d\n", info.err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 void susfs_add_sus_mount_new(void __user **user_info) {
 	struct st_susfs_sus_mount info = {0};
 	int ret;
@@ -1332,6 +1347,7 @@ out:
 	}
 	SUSFS_LOGI("CMD_SUSFS_ADD_SUS_MOUNT -> ret: %d\n", info.err);
 }
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
 /* sdcard monitor (v2.2.0, adapted to 4.14 fsnotify) */
 #include <linux/fsnotify_backend.h>
