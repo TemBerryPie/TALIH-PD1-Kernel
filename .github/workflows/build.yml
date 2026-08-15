@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -12,17 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install cross toolchain deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev flex bison bc
-
       - name: Cache AOSP clang r383902b
         id: cache-clang
         uses: actions/cache@v4
         with:
           path: /opt/clang
-          key: clang-r383902b-android11
+          key: clang-r383902b-v1
 
       - name: Fetch AOSP clang r383902b
         if: steps.cache-clang.outputs.cache-hit != 'true'
@@ -32,10 +31,26 @@ jobs:
           tar -xzf /tmp/clang.tar.gz -C /opt/clang
           ls /opt/clang/bin/clang
 
+      - name: Install cross toolchain deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev flex bison bc ccache
+
+      - name: Cache ccache (incremental build)
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref }}-
+            ccache-
+
       - name: Build Image + dtbs
         run: |
           export PATH="/opt/clang/bin:$PATH"
-          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image dtbs
+          export CCACHE_DIR=$HOME/.ccache
+          export CCACHE_COMPILERCHECK=content
+          make ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image dtbs
 
       - name: Upload Image
         uses: actions/upload-artifact@v4
