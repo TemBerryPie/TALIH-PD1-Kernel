@@ -17,7 +17,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev flex bison bc
 
+      - name: Cache AOSP clang r383902b
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: /opt/clang
+          key: clang-r383902b-android11
+
       - name: Fetch AOSP clang r383902b
+        if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
           mkdir -p /opt/clang
           curl -sL -o /tmp/clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz"
