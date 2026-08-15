@@ -64,6 +64,9 @@
 #include <linux/vmalloc.h>
 
 #include <linux/uaccess.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
 
@@ -1714,6 +1717,14 @@ static int do_execveat_common(int fd, struct filename *filename,
 
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
+
+#ifdef CONFIG_KSU_SUSFS
+	/* Mark user app processes (uid >= 10000) for SUSFS hiding paths.
+	 * Zygote spawns apps with uid already set before exec, so this
+	 * covers every app process incl. isolated ones. */
+	if (unlikely(current_uid().val >= 10000))
+		current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;
+#endif
 
 	/*
 	 * We move the actual failure in case of RLIMIT_NPROC excess from

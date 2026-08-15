@@ -69,7 +69,7 @@ struct vfsmount {
 	struct super_block *mnt_sb;	/* pointer to superblock */
 	int mnt_flags;
 	void *data;
-#if 0 // CONFIG_KSU_SUSFS
+#ifdef CONFIG_KSU_SUSFS
 	u64 susfs_mnt_id_backup;
 #endif
 } __randomize_layout;

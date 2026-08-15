@@ -1390,15 +1390,16 @@ struct task_struct {
 	 * New fields for task_struct should be added above here, so that
 	 * they are included in the randomized portion of task_struct.
 	 */
-#if 0 // CONFIG_KSU_SUSFS
-	u64 susfs_task_state;
-	u64 susfs_last_fake_mnt_id;
-#endif
 	randomized_struct_fields_end
 
 	/* CPU-specific state of this task: */
 	struct thread_struct		thread;
-
+#ifdef CONFIG_KSU_SUSFS
+	/* SUSFS task state flags. Keep after thread_struct so existing
+	 * field offsets (incl. thread) stay ABI-stable for vendor modules. */
+	u64 susfs_task_state;
+	u64 susfs_last_fake_mnt_id;
+#endif
 	/*
 	 * WARNING: on x86, 'thread_struct' contains a variable-sized
 	 * structure.  It *MUST* be at the end of 'task_struct'.
