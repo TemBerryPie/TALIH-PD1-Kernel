@@ -1184,6 +1184,44 @@ int ksu_handle_susfs_cmd(unsigned int cmd, void __user **arg)
         susfs_show_version(arg);
         return 0;
     }
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+    case CMD_SUSFS_TRY_UMOUNT: {
+        susfs_add_try_umount((struct st_susfs_try_umount __user *)*arg);
+        return 0;
+    }
+    case CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS: {
+        susfs_run_umount_for_current_mnt_ns(arg);
+        return 0;
+    }
+    case CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE: {
+        susfs_umount_for_zygote_iso_service(arg);
+        return 0;
+    }
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+    case CMD_SUSFS_SUS_SU: {
+        susfs_sus_su((struct st_sus_su __user *)*arg);
+        return 0;
+    }
+    case CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE: {
+        susfs_show_sus_su_working_mode(arg);
+        return 0;
+    }
+    case CMD_SUSFS_IS_SUS_SU_READY: {
+        susfs_is_sus_su_ready(arg);
+        return 0;
+    }
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_SDCARD_MONITOR
+    case CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH: {
+        susfs_set_android_data_root_path(arg);
+        return 0;
+    }
+    case CMD_SUSFS_SET_SDCARD_ROOT_PATH: {
+        susfs_set_sdcard_root_path(arg);
+        return 0;
+    }
+#endif
     }
     return 0;
 }

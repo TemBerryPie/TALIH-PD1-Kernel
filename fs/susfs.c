@@ -16,12 +16,13 @@
 #include <linux/susfs.h>
 #include "mount.h"
 
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+extern int path_umount(struct path *path, int flags);
+#endif
+
 static spinlock_t susfs_spin_lock;
 
 extern bool susfs_is_current_ksu_domain(void);
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-extern void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid);
-#endif
 
 #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 bool susfs_is_log_enabled __read_mostly = true;
@@ -522,6 +523,16 @@ void susfs_sus_ino_for_show_map_vma(unsigned long ino, dev_t *out_dev, unsigned 
 
 /* try_umount */
 #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+/* 4.14 simplified umount: unmount the path in the current mount namespace. */
+void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid) {
+	struct path path;
+
+	(void)check_mnt;
+	(void)uid;
+	if (!kern_path(mnt, 0, &path)) {
+		path_umount(&path, flags);
+	}
+}
 static LIST_HEAD(LH_TRY_UMOUNT_PATH);
 int susfs_add_try_umount(struct st_susfs_try_umount* __user user_info) {
 	struct st_susfs_try_umount_list *cursor = NULL, *temp = NULL;
@@ -845,8 +856,63 @@ struct filename* susfs_get_redirected_path(unsigned long ino) {
 #ifdef CONFIG_KSU_SUSFS_SUS_SU
 bool susfs_is_sus_su_hooks_enabled __read_mostly = false;
 static int susfs_sus_su_working_mode = 0;
-extern void ksu_susfs_enable_sus_su(void);
-extern void ksu_susfs_disable_sus_su(void);
+
+/* Non-kprobe sus_su for 4.14: mark the su inodes with INODE_STATE_SUS_PATH
+ * so the existing sus_path hooks hide them from user app processes. */
+static const char *sus_su_paths[] = {
+	"/system/bin/su",
+	"/system/xbin/su",
+	"/system/bin/ksu_susfs",
+	"/debug_ramdisk/ksu/bin/su",
+	NULL,
+};
+
+static void susfs_set_su_inodes_state(unsigned long state)
+{
+	int i;
+
+	for (i = 0; sus_su_paths[i]; i++) {
+		struct path p;
+
+		if (kern_path(sus_su_paths[i], LOOKUP_FOLLOW, &p))
+			continue;
+		if (p.dentry && p.dentry->d_inode) {
+			if (state)
+				p.dentry->d_inode->i_state |= INODE_STATE_SUS_PATH;
+			else
+				p.dentry->d_inode->i_state &= ~INODE_STATE_SUS_PATH;
+		}
+		path_put(&p);
+	}
+}
+
+void ksu_susfs_enable_sus_su(void) {
+	susfs_set_su_inodes_state(INODE_STATE_SUS_PATH);
+}
+
+void ksu_susfs_disable_sus_su(void) {
+	susfs_set_su_inodes_state(0);
+}
+
+void susfs_show_sus_su_working_mode(void __user **user_info) {
+	struct st_susfs_sus_su_working_mode info = {0};
+
+	info.mode = susfs_sus_su_working_mode;
+	info.err = 0;
+	if (copy_to_user((struct st_susfs_sus_su_working_mode __user*)*user_info, &info, sizeof(info)))
+		info.err = -EFAULT;
+	SUSFS_LOGI("CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE -> ret: %d, mode: %d\n", info.err, info.mode);
+}
+
+void susfs_is_sus_su_ready(void __user **user_info) {
+	struct st_susfs_sus_su_ready info = {0};
+
+	info.ready = susfs_is_sus_su_hooks_enabled ? 1 : 0;
+	info.err = 0;
+	if (copy_to_user((struct st_susfs_sus_su_ready __user*)*user_info, &info, sizeof(info)))
+		info.err = -EFAULT;
+	SUSFS_LOGI("CMD_SUSFS_IS_SUS_SU_READY -> ret: %d, ready: %d\n", info.err, info.ready);
+}
 
 int susfs_get_sus_su_working_mode(void) {
 	return susfs_sus_su_working_mode;
@@ -1460,10 +1526,116 @@ static int susfs_sdcard_monitor_fn(void *data)
 }
 
 void susfs_start_sdcard_monitor_fn(void) {
+	static bool started = false;
+
+	if (started)
+		return;
+	started = true;
 	if (IS_ERR(kthread_run(susfs_sdcard_monitor_fn, NULL, "susfs_sdcard_monitor"))) {
 		SUSFS_LOGE("failed to create thread susfs_sdcard_monitor\n");
 	}
 }
+
+/* v2.2.0 sdcard monitor command handlers */
+#ifdef CONFIG_KSU_SUSFS_SUS_SDCARD_MONITOR
+static char susfs_android_data_root_path[SUSFS_MAX_LEN_PATHNAME];
+static char susfs_sdcard_root_path[SUSFS_MAX_LEN_PATHNAME];
+
+static void susfs_add_sus_path_loop_internal(const char *pathname)
+{
+	struct st_susfs_sus_path_list *new_list = NULL;
+
+	if (!pathname || !*pathname)
+		return;
+	new_list = kzalloc(sizeof(struct st_susfs_sus_path_list), GFP_KERNEL);
+	if (!new_list)
+		return;
+	strncpy(new_list->target_pathname, pathname, SUSFS_MAX_LEN_PATHNAME - 1);
+	mutex_lock(&susfs_mutex_lock_sus_path);
+	list_add_tail(&new_list->list, &LH_SUS_PATH_LOOP);
+	mutex_unlock(&susfs_mutex_lock_sus_path);
+	SUSFS_LOGI("path '%s' added to LH_SUS_PATH_LOOP\n", pathname);
+}
+
+void susfs_set_android_data_root_path(void __user **user_info) {
+	struct st_susfs_set_android_data_root_path info = {0};
+
+	if (copy_from_user(&info, (struct st_susfs_set_android_data_root_path __user*)*user_info, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out_copy_to_user;
+	}
+	if (*info.android_data_root_path == '\0') {
+		SUSFS_LOGE("android_data_root_path cannot be empty\n");
+		info.err = -EINVAL;
+		goto out_copy_to_user;
+	}
+	strncpy(susfs_android_data_root_path, info.android_data_root_path, SUSFS_MAX_LEN_PATHNAME - 1);
+	/* The sdcard Android dir to hide: <data_root>/media/0/Android */
+	{
+		char sdcard_android_path[SUSFS_MAX_LEN_PATHNAME];
+		snprintf(sdcard_android_path, sizeof(sdcard_android_path),
+			 "%s/media/0/Android", susfs_android_data_root_path);
+		susfs_add_sus_path_loop_internal(sdcard_android_path);
+	}
+	info.err = 0;
+	SUSFS_LOGI("android_data_root_path: %s\n", susfs_android_data_root_path);
+	susfs_start_sdcard_monitor_fn();
+out_copy_to_user:
+	if (copy_to_user(&((struct st_susfs_set_android_data_root_path __user*)*user_info)->err, &info.err, sizeof(info.err))) {
+		info.err = -EFAULT;
+	}
+	SUSFS_LOGI("CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH -> ret: %d\n", info.err);
+}
+
+void susfs_set_sdcard_root_path(void __user **user_info) {
+	struct st_susfs_set_sdcard_root_path info = {0};
+
+	if (copy_from_user(&info, (struct st_susfs_set_sdcard_root_path __user*)*user_info, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out_copy_to_user;
+	}
+	if (*info.sdcard_root_path == '\0') {
+		SUSFS_LOGE("sdcard_root_path cannot be empty\n");
+		info.err = -EINVAL;
+		goto out_copy_to_user;
+	}
+	strncpy(susfs_sdcard_root_path, info.sdcard_root_path, SUSFS_MAX_LEN_PATHNAME - 1);
+	{
+		char sdcard_android_path[SUSFS_MAX_LEN_PATHNAME];
+		snprintf(sdcard_android_path, sizeof(sdcard_android_path),
+			 "%s/Android", susfs_sdcard_root_path);
+		susfs_add_sus_path_loop_internal(sdcard_android_path);
+	}
+	info.err = 0;
+	SUSFS_LOGI("sdcard_root_path: %s\n", susfs_sdcard_root_path);
+	susfs_start_sdcard_monitor_fn();
+out_copy_to_user:
+	if (copy_to_user(&((struct st_susfs_set_sdcard_root_path __user*)*user_info)->err, &info.err, sizeof(info.err))) {
+		info.err = -EFAULT;
+	}
+	SUSFS_LOGI("CMD_SUSFS_SET_SDCARD_ROOT_PATH -> ret: %d\n", info.err);
+}
+#endif /* CONFIG_KSU_SUSFS_SUS_SDCARD_MONITOR */
+
+/* v2.2.0 umount command handlers */
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+extern void susfs_run_try_umount_for_current_mnt_ns(void);
+
+void susfs_run_umount_for_current_mnt_ns(void __user **user_info) {
+	int err = 0;
+
+	susfs_run_try_umount_for_current_mnt_ns();
+	if (copy_to_user((int __user*)*user_info, &err, sizeof(err))) {
+		err = -EFAULT;
+	}
+	SUSFS_LOGI("CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS -> ret: %d\n", err);
+}
+
+void susfs_umount_for_zygote_iso_service(void __user **user_info) {
+	susfs_try_umount(current_uid().val);
+	SUSFS_LOGI("CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE done\n");
+}
+#endif /* CONFIG_KSU_SUSFS_TRY_UMOUNT */
 
 struct work_struct susfs_extra_works;
 EXPORT_SYMBOL(susfs_extra_works);

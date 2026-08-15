@@ -160,3 +160,30 @@ config KSU_SUSFS_SUS_MAP
 
 
 endmenu
+
+config KSU_SUSFS_TRY_UMOUNT
+    bool "Enable to try umount for ksu"
+    depends on KSU_SUSFS
+    default y
+    help
+        - Allow umounting user-defined paths for zygote spawned user app processes (uid >= 10000).
+        - Also provides umount for current mount namespace and zygote isolated services.
+
+config KSU_SUSFS_SUS_SU
+    bool "Enable to hide the su path via sus_path hooks"
+    depends on KSU_SUSFS
+    depends on KSU_SUSFS_SUS_PATH
+    default y
+    help
+        - Marks su binaries (/system/bin/su etc.) with INODE_STATE_SUS_PATH so
+          zygote spawned user app processes cannot see or access them.
+        - Non-kprobe implementation for 4.14: direct inode marking.
+
+config KSU_SUSFS_SUS_SDCARD_MONITOR
+    bool "Enable sdcard monitor to auto hide the Android data dir"
+    depends on KSU_SUSFS
+    depends on KSU_SUSFS_SUS_PATH
+    default y
+    help
+        - Watches /data/media/0 with fsnotify; when the Android directory is
+          created, refreshes sus_path rules so apps cannot see it.

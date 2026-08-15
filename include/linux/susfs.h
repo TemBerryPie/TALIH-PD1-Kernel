@@ -126,6 +126,29 @@ struct st_susfs_open_redirect_hlist {
 struct st_sus_su {
 	int         mode;
 };
+
+struct st_susfs_sus_su_working_mode {
+	int         mode;
+	int         err;
+};
+
+struct st_susfs_sus_su_ready {
+	int         ready;
+	int         err;
+};
+#endif
+
+/* sdcard monitor */
+#ifdef CONFIG_KSU_SUSFS_SUS_SDCARD_MONITOR
+struct st_susfs_set_android_data_root_path {
+	char        android_data_root_path[SUSFS_MAX_LEN_PATHNAME];
+	int         err;
+};
+
+struct st_susfs_set_sdcard_root_path {
+	char        sdcard_root_path[SUSFS_MAX_LEN_PATHNAME];
+	int         err;
+};
 #endif
 
 /***********************/
@@ -237,6 +260,8 @@ struct filename* susfs_get_redirected_path(unsigned long ino);
 #ifdef CONFIG_KSU_SUSFS_SUS_SU
 int susfs_get_sus_su_working_mode(void);
 int susfs_sus_su(struct st_sus_su* __user user_info);
+void susfs_show_sus_su_working_mode(void __user **user_info);
+void susfs_is_sus_su_ready(void __user **user_info);
 #endif
 /* susfs_init */
 void susfs_init(void);
