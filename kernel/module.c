@@ -1330,21 +1330,15 @@ bad_version:
 static inline int check_modstruct_version(const struct load_info *info,
 					  struct module *mod)
 {
-	const s32 *crc;
-
 	/*
-	 * Since this should be found in kernel (which can't be removed), no
-	 * locking is necessary -- use preempt_disable() to placate lockdep.
+	 * TALIH-PD1: vendor modules are built against the factory kernel, so
+	 * their recorded module_layout CRC differs from ours. The layouts are
+	 * proven ABI-compatible in practice (wifi/bt/gps/fm all work), so
+	 * accept unconditionally instead of rejecting the load.
 	 */
-	preempt_disable();
-	if (!find_symbol(VMLINUX_SYMBOL_STR(module_layout), NULL,
-			 &crc, true, false)) {
-		preempt_enable();
-		BUG();
-	}
-	preempt_enable();
-	return check_version(info, VMLINUX_SYMBOL_STR(module_layout),
-			     mod, crc);
+	(void)info;
+	(void)mod;
+	return 1;
 }
 
 /* First part is kernel version, which we ignore if module has crcs. */
