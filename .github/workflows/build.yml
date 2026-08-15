@@ -1,0 +1,36 @@
+name: build-kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev flex bison bc
+
+      - name: Fetch AOSP clang r383902b
+        run: |
+          mkdir -p /opt/clang
+          curl -sL -o /tmp/clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz"
+          tar -xzf /tmp/clang.tar.gz -C /opt/clang
+          ls /opt/clang/bin/clang
+
+      - name: Build Image + dtbs
+        run: |
+          export PATH="/opt/clang/bin:$PATH"
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image dtbs
+
+      - name: Upload Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-TALIH-PD1
+          path: arch/arm64/boot/Image
