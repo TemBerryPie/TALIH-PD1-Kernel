@@ -567,6 +567,12 @@ int susfs_add_try_umount(struct st_susfs_try_umount* __user user_info) {
 	return 0;
 }
 
+void susfs_try_umount_all(uid_t target_uid) {
+	/* 4.14 simplified: iterate the try-umount list in the current
+	 * mount namespace instead of per-task namespace switching. */
+	susfs_try_umount(target_uid);
+}
+
 void susfs_try_umount(uid_t target_uid) {
 	struct st_susfs_try_umount_list *cursor = NULL;
 
