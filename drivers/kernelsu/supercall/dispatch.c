@@ -1185,7 +1185,7 @@ int ksu_handle_susfs_cmd(unsigned int cmd, void __user **arg)
         return 0;
     }
 #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
-    case CMD_SUSFS_TRY_UMOUNT: {
+    case CMD_SUSFS_ADD_TRY_UMOUNT: {
         susfs_add_try_umount((struct st_susfs_try_umount __user *)*arg);
         return 0;
     }
