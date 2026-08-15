@@ -1,12 +1,11 @@
 TALIH-PD1 Kernel (tb8788p1_64_wifi, MT6771)
 ==========================================
 
-Chuwi HiPad Plus / Swaiot AIP10A / 读书郎 C13 Pro / SUPI T11 等
 tb8788p1_64_wifi 公版平板的内核源码 (MediaTek MT6771 / Helio P60, PMIC MT6358)。
 
-- 内核版本: 4.14.186 (与原厂一致, vermagic 匹配原厂 vendor 模块)
+- 内核版本: 4.14.186
 - 基础源码: ubuntu-touch-unihertz-titan/kernel-alps-mt6771 (alps-mp-r0 BSP)
-- 编译链: clang 11.0.1 r383902 (与原厂构建版本相同)
+- 编译链: clang 11.0.1 r383902
 
 
 构建 (GitHub Actions)
@@ -121,22 +120,3 @@ KernelSU (SukiSU Ultra) 集成
   wrapper; 4.14 无 seccomp action-cache -> disable_seccomp() 路径;
   CONFIG_FTRACE_SYSCALLS=y 必须开; reboot/input kprobe handler 用直接参数。
 - Manager 显示 v4.1.3-TALIH-PD1@Fumor (KSU_VERSION_FULL 在 Kbuild 写死)。
-
-
-已知次要问题
-------------
-
-- hx83102p_fhdp_dsi_vdo_boe platform driver 名在两个面板拷贝中重复
-  (第二次注册 abort, 不影响主面板)。
-- s5k3l7 相机传感器无公开源码 (占位 stub)。
-- 元模块 (Hybrid Mount/mountify/meta-overlayfs) 与 GSI 兼容性受限: overlay 依赖
-  /system/bin symlink (GSI 为真目录) 或 5.x 内核 API; 目录型固化模块 (gms/vending/
-  hwid 的 priv-app) 由 KSU 内核 overlay 挂载生效, 单文件模块走 Hybrid Mount magic。
-
-
-参考资料
---------
-
-- 公开固件 dump: r0rt1z2-dumpyard/chuwi_hipadplus_dump (同板 tb8788p1_64_wifi,
-  含 boot/vendor/dtbo, 可提取触摸固件与 dtb)。
-- Himax 官方参考: HimaxSoftware/HX83112_Android_Driver (incell 实现参考)。
