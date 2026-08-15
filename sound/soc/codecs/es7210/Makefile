@@ -1,0 +1,1 @@
+obj-$(CONFIG_TCT_ES7210) += es7210.o
