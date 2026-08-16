@@ -440,3 +440,12 @@ config MTK_CONNSYS_DEDICATED_LOG_PATH
 	     (by EMI or other specific path)
 	  2. The scope may include (but not limited) Wi-Fi firmware log,
 	     BT firmware log, GPS firmware log etc.
+
+config WLAN_DRV_BUILD_IN
+	bool "Build WMT combo driver into kernel"
+	depends on MTK_COMBO
+	default n
+	help
+	  Build the wmt_drv (WMT combo driver, restored from mt6771
+	  source) into the kernel instead of loading it as a vendor
+	  module. WiFi/BT/GPS/FM drivers stay as vendor modules.
