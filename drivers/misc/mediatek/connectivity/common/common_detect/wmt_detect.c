@@ -398,8 +398,12 @@ static void wmt_detect_driver_exit(void)
 	WMT_DETECT_PR_INFO("done\n");
 }
 
+#ifdef MODULE
 module_init(wmt_detect_driver_init);
 module_exit(wmt_detect_driver_exit);
+#else
+late_initcall(wmt_detect_driver_init);
+#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Zhiguo.Niu & Chaozhong.Liang @ MBJ/WCNSE/SS1");
