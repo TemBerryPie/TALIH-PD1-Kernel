@@ -369,6 +369,7 @@ err0:
 	return ret ? ret : -1;
 }
 
+#ifdef MODULE
 static void wmt_detect_driver_exit(void)
 {
 	dev_t dev = MKDEV(gWmtDetectMajor, 0);
@@ -397,6 +398,7 @@ static void wmt_detect_driver_exit(void)
 
 	WMT_DETECT_PR_INFO("done\n");
 }
+#endif
 
 #ifdef MODULE
 module_init(wmt_detect_driver_init);
