@@ -480,6 +480,9 @@ static void boot_stage1(unsigned long vfs_addr, unsigned long tlog_addr)
 {
 	int retVal = 0;
 
+	pr_err("[414_diag] boot_stage1 vfs_addr=0x%lx tlog_addr=0x%lx cpu=%d\n",
+		vfs_addr, tlog_addr, smp_processor_id());
+
 	switch_input_index = ((unsigned long)switch_input_index  + 1) % 10000;
 
 	retVal = add_work_entry(SMC_CALL_TYPE, N_INIT_T_BOOT_STAGE1,
