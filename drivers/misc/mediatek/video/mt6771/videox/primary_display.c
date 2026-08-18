@@ -8856,7 +8856,10 @@ int primary_display_setbacklight(unsigned int level)
 				mmprofile_log_ex(
 					ddp_mmp_get_events()->primary_set_bl,
 					MMPROFILE_FLAG_PULSE, 0, 7);
-				_set_backlight_by_cmdq(level);
+				/* tb8788p1: use CPU mode for backlight in VDO
+				 * to avoid CMDQ transaction overhead causing
+				 * subtle periodic flicker (8-10Hz). */
+				_set_backlight_by_cpu(level);
 			} else {
 				_set_backlight_by_cmdq(level);
 			}
