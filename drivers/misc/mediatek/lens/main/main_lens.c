@@ -198,25 +198,22 @@ static int af_pinctrl_init(struct device *pdev)
 			LOG_INF("Failed to get af pinctrl.\n");
 			ret = PTR_ERR(af_pinctrl);
 			af_pinctrl = NULL;
-			return ret;
-		}
-
-		/* AF HWEN pin initialization */
-		af_hwen_high = pinctrl_lookup_state(
-				af_pinctrl, AF_PINCTRL_STATE_HWEN_HIGH);
-		if (IS_ERR(af_hwen_high)) {
-			LOG_INF("Failed to init (%s)\n",
-				AF_PINCTRL_STATE_HWEN_HIGH);
-			ret = PTR_ERR(af_hwen_high);
-			af_hwen_high = NULL;
-		}
-		af_hwen_low = pinctrl_lookup_state(
-			af_pinctrl, AF_PINCTRL_STATE_HWEN_LOW);
-		if (IS_ERR(af_hwen_low)) {
-			LOG_INF("Failed to init (%s)\n",
-				AF_PINCTRL_STATE_HWEN_LOW);
-			ret = PTR_ERR(af_hwen_low);
-			af_hwen_low = NULL;
+		} else {
+			/* AF HWEN pin initialization */
+			af_hwen_high = pinctrl_lookup_state(
+					af_pinctrl, AF_PINCTRL_STATE_HWEN_HIGH);
+			if (IS_ERR(af_hwen_high)) {
+				LOG_INF("Failed to init (%s)\n",
+					AF_PINCTRL_STATE_HWEN_HIGH);
+				af_hwen_high = NULL;
+			}
+			af_hwen_low = pinctrl_lookup_state(
+				af_pinctrl, AF_PINCTRL_STATE_HWEN_LOW);
+			if (IS_ERR(af_hwen_low)) {
+				LOG_INF("Failed to init (%s)\n",
+					AF_PINCTRL_STATE_HWEN_LOW);
+				af_hwen_low = NULL;
+			}
 		}
 	}
 	/* tb8788p1: the platform device has no of_node so the pinctrl state
