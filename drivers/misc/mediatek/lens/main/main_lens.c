@@ -238,13 +238,27 @@ static int af_pinctrl_set(int pin, int state)
 {
 	int ret = 0;
 
-	LOG_INF("+");
+	LOG_INF("+ (pin=%d state=%d gpio_valid=%d)\n", pin, state,
+		af_hwen_gpio_valid);
 	/* tb8788p1: GPIO169 direct fallback (see af_pinctrl_init) */
-	if (pin == AF_PINCTRL_PIN_HWEN && af_hwen_gpio_valid) {
-		gpio_set_value(AF_HWEN_GPIO, state);
-		LOG_INF("hw_en gpio %d = %d\n", AF_HWEN_GPIO, state);
-		LOG_INF("-");
-		return 0;
+	if (pin == AF_PINCTRL_PIN_HWEN) {
+		if (!af_hwen_gpio_valid) {
+			/* claim the vcamaf LDO enable pin on demand */
+			ret = gpio_request(AF_HWEN_GPIO, "af_hwen");
+			if (ret) {
+				LOG_INF("af_hwen gpio request fail %d\n", ret);
+			} else {
+				af_hwen_gpio_valid = 1;
+			}
+		}
+		if (af_hwen_gpio_valid) {
+			gpio_direction_output(AF_HWEN_GPIO, state);
+			gpio_set_value(AF_HWEN_GPIO, state);
+			LOG_INF("hw_en gpio %d = %d\n", AF_HWEN_GPIO, state);
+			LOG_INF("-");
+			return 0;
+		}
+		LOG_INF("hw_en gpio unavailable, try pinctrl\n");
 	}
 	if (af_pinctrl == NULL) {
 		LOG_INF("pinctrl is not available\n");
