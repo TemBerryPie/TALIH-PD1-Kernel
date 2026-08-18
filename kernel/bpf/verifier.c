@@ -1856,6 +1856,7 @@ static int check_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
 
 	if (!fn) {
 		verbose("unknown func %s#%d\n", func_id_name(func_id), func_id);
+		pr_info("bpf_verifier: unknown func %s#%d\n", func_id_name(func_id), func_id);
 		return -EINVAL;
 	}
 
@@ -5053,6 +5054,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
 skip_full_check:
 	while (!pop_stack(env, NULL, NULL));
 	free_states(env);
+
+	if (ret)
+		pr_info("bpf_verifier: program rejected (ret=%d) prog_type=%d insns=%d\n",
+			ret, (*prog)->type, (*prog)->len);
 
 	if (ret == 0)
 		sanitize_dead_code(env);
