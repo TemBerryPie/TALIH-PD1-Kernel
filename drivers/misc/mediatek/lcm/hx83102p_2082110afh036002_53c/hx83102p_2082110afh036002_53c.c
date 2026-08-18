@@ -646,7 +646,7 @@ static struct LCM_setting_table
 	{REGFLAG_DELAY, 120, {} },
 };
 
-static struct LCM_setting_table __maybe_unused lcm_sleep_out_setting[] = {
+static struct LCM_setting_table lcm_sleep_out_setting[] = {
 	{0x11, 1, {0x00} },
 	{REGFLAG_DELAY, 120, {} },
 	{0x29, 1, {0x00} },
@@ -871,6 +871,13 @@ static void lcm_resume(void)
 
 	lcm_it6112_replay();
 	MDELAY(100);
+
+	/* tb8788p1: after a long screen-off the it6112 bridge and the TDDI
+	 * lose their MIPI/display-on state; the whole-chip reset pulse above
+	 * returns the panel to sleep mode, so re-issue sleep-out + display-on
+	 * here or the panel stays dark (backlight only) on a long-idle wake. */
+	push_table(NULL, lcm_sleep_out_setting,
+		   ARRAY_SIZE(lcm_sleep_out_setting), 1);
 
 	lcm_set_gpio_output(LCM_GPIO_BL, GPIO_OUT_ONE);
 	LCM_LOGI("[Kernel/LCM] %s exit\n", __func__);
