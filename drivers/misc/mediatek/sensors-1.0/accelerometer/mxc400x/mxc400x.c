@@ -35,7 +35,7 @@
 #define MXC400X_CTRL_ACTIVE		0x40
 
 #define MXC400X_AXES_NUM		3
-#define MXC400X_DATA_LEN		9
+#define MXC400X_DATA_LEN		6
 
 #define MXC400X_GRAVITY_EARTH_1000	9807
 
@@ -128,12 +128,12 @@ static int mxc400x_set_power_mode(struct i2c_client *client, bool enable)
 static int mxc400x_read_data(struct i2c_client *client, int *x, int *y, int *z)
 {
 	u8 buf[MXC400X_DATA_LEN];
-	u8 zbuf[2];
 	int err;
 
-	/* tb8788p1 (MXC665X): X=0x03/0x04, Y=0x05/0x06. The Z lives at
-	 * 0x0A/0x0B but the chip's auto-increment does NOT cover 0x09+
-	 * in a multi-byte read (returns garbage) - read it separately. */
+	/* tb8788p1 (MXC665X): X=0x03/0x04, Y=0x05/0x06, Z=0x07/0x08 -
+	 * one 6-byte block read covers all three axes (12-bit left-aligned,
+	 * big-endian per axis). The earlier 0x0A/0x0B "Z" was actually a
+	 * fixed chip register (0x2b, never moves with tilt). */
 	err = mxc400x_i2c_read_block(client, MXC400X_REG_XOUT, buf,
 				     MXC400X_DATA_LEN);
 	if (err)
@@ -141,11 +141,7 @@ static int mxc400x_read_data(struct i2c_client *client, int *x, int *y, int *z)
 
 	*x = (int)((s16)((buf[0] << 8) | buf[1]) >> 4);
 	*y = (int)((s16)((buf[2] << 8) | buf[3]) >> 4);
-
-	err = mxc400x_i2c_read_block(client, 0x0a, zbuf, 2);
-	if (err)
-		return err;
-	*z = (int)((((zbuf[1] << 8) | zbuf[0]) & 0x0fff) >> 4);
+	*z = (int)((s16)((buf[4] << 8) | buf[5]) >> 4);
 	return 0;
 }
 
