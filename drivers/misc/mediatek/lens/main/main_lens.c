@@ -25,6 +25,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/gpio.h>
+#include <linux/gpio/driver.h>
 #include <linux/uaccess.h>
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>
@@ -185,6 +186,36 @@ static struct pinctrl *af_pinctrl;
 static struct pinctrl_state *af_hwen_high;
 static struct pinctrl_state *af_hwen_low;
 static int af_hwen_gpio_valid;
+static int g_af_hwen_gpio = -1;
+
+/* tb8788p1: the pinctrl gpiochip uses a dynamically allocated base, so the
+ * global gpio number is chip->base + AF_HWEN_GPIO; gpio_request(169) alone
+ * returns -EPROBE_DEFER (desc not found). Resolve via the chip's of_node. */
+static int af_gpiochip_match(struct gpio_chip *chip, void *data)
+{
+	if (chip->of_node)
+		return of_device_is_compatible(chip->of_node,
+					       "mediatek,mt6771-pinctrl");
+	return 0;
+}
+
+static int af_hwen_gpio_resolve(void)
+{
+	struct gpio_chip *chip;
+
+	if (g_af_hwen_gpio >= 0)
+		return g_af_hwen_gpio;
+
+	chip = gpiochip_find(NULL, af_gpiochip_match);
+	if (!chip) {
+		LOG_INF("cannot find mt6771 pinctrl gpiochip\n");
+		return -ENODEV;
+	}
+	g_af_hwen_gpio = chip->base + AF_HWEN_GPIO;
+	LOG_INF("hwen gpio global number = %d (chip base %d)\n",
+		g_af_hwen_gpio, chip->base);
+	return g_af_hwen_gpio;
+}
 
 static int af_pinctrl_init(struct device *pdev)
 {
@@ -220,14 +251,16 @@ static int af_pinctrl_init(struct device *pdev)
 	 * lookup never matches; drive the vcamaf LDO enable (GPIO169)
 	 * directly as a fallback. */
 	if (!af_hwen_high || !af_hwen_low) {
-		ret = gpio_request(AF_HWEN_GPIO, "af_hwen");
+		ret = af_hwen_gpio_resolve();
+		if (ret >= 0)
+			ret = gpio_request(ret, "af_hwen");
 		if (ret) {
 			LOG_INF("af_hwen gpio request fail %d\n", ret);
 		} else {
-			gpio_direction_output(AF_HWEN_GPIO,
+			gpio_direction_output(g_af_hwen_gpio,
 					      AF_PINCTRL_PINSTATE_LOW);
 			af_hwen_gpio_valid = 1;
-			LOG_INF("af_hwen gpio %d ready\n", AF_HWEN_GPIO);
+			LOG_INF("af_hwen gpio %d ready\n", g_af_hwen_gpio);
 		}
 	}
 	LOG_INF("-");
@@ -244,7 +277,9 @@ static int af_pinctrl_set(int pin, int state)
 	if (pin == AF_PINCTRL_PIN_HWEN) {
 		if (!af_hwen_gpio_valid) {
 			/* claim the vcamaf LDO enable pin on demand */
-			ret = gpio_request(AF_HWEN_GPIO, "af_hwen");
+			ret = af_hwen_gpio_resolve();
+			if (ret >= 0)
+				ret = gpio_request(ret, "af_hwen");
 			if (ret) {
 				LOG_INF("af_hwen gpio request fail %d\n", ret);
 			} else {
@@ -252,9 +287,9 @@ static int af_pinctrl_set(int pin, int state)
 			}
 		}
 		if (af_hwen_gpio_valid) {
-			gpio_direction_output(AF_HWEN_GPIO, state);
-			gpio_set_value(AF_HWEN_GPIO, state);
-			LOG_INF("hw_en gpio %d = %d\n", AF_HWEN_GPIO, state);
+			gpio_direction_output(g_af_hwen_gpio, state);
+			gpio_set_value(g_af_hwen_gpio, state);
+			LOG_INF("hw_en gpio %d = %d\n", g_af_hwen_gpio, state);
 			LOG_INF("-");
 			return 0;
 		}
