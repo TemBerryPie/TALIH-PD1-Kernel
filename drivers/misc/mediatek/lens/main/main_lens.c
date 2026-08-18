@@ -24,6 +24,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/gpio.h>
 #include <linux/uaccess.h>
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>
@@ -176,9 +177,14 @@ static struct device *lens_device;
 #define AF_PINCTRL_PINSTATE_HIGH 1
 #define AF_PINCTRL_STATE_HWEN_HIGH     "camera_pins_cam0_vcamaf_on"
 #define AF_PINCTRL_STATE_HWEN_LOW      "camera_pins_cam0_vcamaf_off"
+/* tb8788p1: the platform device has no of_node, so the pinctrl state lookup
+ * above never matches; fall back to driving the vcamaf LDO enable pin
+ * (GPIO169, pinmux 0xa9 = camera_pins_cam0_vcamaf_on) directly. */
+#define AF_HWEN_GPIO 169
 static struct pinctrl *af_pinctrl;
 static struct pinctrl_state *af_hwen_high;
 static struct pinctrl_state *af_hwen_low;
+static int af_hwen_gpio_valid;
 
 static int af_pinctrl_init(struct device *pdev)
 {
@@ -213,6 +219,20 @@ static int af_pinctrl_init(struct device *pdev)
 			af_hwen_low = NULL;
 		}
 	}
+	/* tb8788p1: the platform device has no of_node so the pinctrl state
+	 * lookup never matches; drive the vcamaf LDO enable (GPIO169)
+	 * directly as a fallback. */
+	if (!af_hwen_high || !af_hwen_low) {
+		ret = gpio_request(AF_HWEN_GPIO, "af_hwen");
+		if (ret) {
+			LOG_INF("af_hwen gpio request fail %d\n", ret);
+		} else {
+			gpio_direction_output(AF_HWEN_GPIO,
+					      AF_PINCTRL_PINSTATE_LOW);
+			af_hwen_gpio_valid = 1;
+			LOG_INF("af_hwen gpio %d ready\n", AF_HWEN_GPIO);
+		}
+	}
 	LOG_INF("-");
 	return ret;
 }
@@ -222,6 +242,13 @@ static int af_pinctrl_set(int pin, int state)
 	int ret = 0;
 
 	LOG_INF("+");
+	/* tb8788p1: GPIO169 direct fallback (see af_pinctrl_init) */
+	if (pin == AF_PINCTRL_PIN_HWEN && af_hwen_gpio_valid) {
+		gpio_set_value(AF_HWEN_GPIO, state);
+		LOG_INF("hw_en gpio %d = %d\n", AF_HWEN_GPIO, state);
+		LOG_INF("-");
+		return 0;
+	}
 	if (af_pinctrl == NULL) {
 		LOG_INF("pinctrl is not available\n");
 		return -1;
