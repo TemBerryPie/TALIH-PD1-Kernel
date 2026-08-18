@@ -174,8 +174,8 @@ static struct device *lens_device;
 #define AF_PINCTRL_PIN_HWEN 0
 #define AF_PINCTRL_PINSTATE_LOW 0
 #define AF_PINCTRL_PINSTATE_HIGH 1
-#define AF_PINCTRL_STATE_HWEN_HIGH     "cam0_ldo_vcamaf_1"
-#define AF_PINCTRL_STATE_HWEN_LOW      "cam0_ldo_vcamaf_0"
+#define AF_PINCTRL_STATE_HWEN_HIGH     "camera_pins_cam0_vcamaf_on"
+#define AF_PINCTRL_STATE_HWEN_LOW      "camera_pins_cam0_vcamaf_off"
 static struct pinctrl *af_pinctrl;
 static struct pinctrl_state *af_hwen_high;
 static struct pinctrl_state *af_hwen_low;
