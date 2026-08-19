@@ -33,13 +33,20 @@ jobs:
 
       - name: Install cross toolchain deps
         run: |
-          sudo tee /etc/apt/apt.conf.d/99retry >/dev/null <<'EOF'
-          Acquire::Retries "3";
-          Acquire::http::Timeout "15";
-          Acquire::https::Timeout "15";
-          Acquire::ftp::Timeout "15";
-          EOF
           export DEBIAN_FRONTEND=noninteractive
+          # azure.archive.ubuntu.com throttles the aarch64 cross-toolchain
+          # .debs (a 52 kB file took 33s -> 10MB cpp-13 hangs). Swap to the
+          # canonical HTTPS mirror and relax the acquire timeouts.
+          sudo rm -f /etc/apt/apt-mirrors.txt
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          sudo tee /etc/apt/apt.conf.d/99retry >/dev/null <<'EOF'
+          Acquire::Retries "5";
+          Acquire::http::Timeout "120";
+          Acquire::https::Timeout "120";
+          Acquire::ftp::Timeout "120";
+          EOF
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libssl-dev flex bison bc ccache
 
