@@ -3283,12 +3283,25 @@ static int stk3x1x_i2c_probe(struct i2c_client *client,
 	APS_LOG("%s: driver version: %s\n", __func__, DRIVER_VERSION);
 	err = get_alsps_dts_func(client->dev.of_node, hw);
 	/* tb8788p1: the stock DT has no generic i2c_addr, only the
-	 * chip-specific stk3x3x_addr (0x57) - read it explicitly */
+	 * chip-specific stk3x3x_addr (0x57) - read it explicitly.
+	 * The same DT also names the proximity thresholds chip-specifically
+	 * (stk3x3x_thld_high/low), so the generic ps_threshold_high/low
+	 * lookup in get_alsps_dts_func() returns 0 -> PS reads above 0 and
+	 * the near-field flag latches on (sensor always reports "covered").
+	 * Read the chip-specific thresholds explicitly too. */
 	{
 		u32 a = 0;
 		if (of_property_read_u32(client->dev.of_node,
 					 "stk3x3x_addr", &a) == 0 && a)
 			hw->i2c_addr[0] = a;
+		a = 0;
+		if (of_property_read_u32(client->dev.of_node,
+					 "stk3x3x_thld_high", &a) == 0 && a)
+			hw->ps_threshold_high = a;
+		a = 0;
+		if (of_property_read_u32(client->dev.of_node,
+					 "stk3x3x_thld_low", &a) == 0 && a)
+			hw->ps_threshold_low = a;
 	}
 	if (err < 0) {
 		APS_ERR("get customization info from dts failed\n");
