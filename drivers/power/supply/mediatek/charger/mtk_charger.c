@@ -1303,6 +1303,12 @@ static int mtk_charger_plug_out(struct charger_manager *info)
 	info->chr_type = CHARGER_UNKNOWN;
 	info->charger_thread_polling = false;
 	info->pd_reset = false;
+	/* tb8788p1: cancel the periodic charger alarm timer on unplug.
+	 * Without this the timer keeps firing every CHARGING_INTERVAL (10s),
+	 * calling _wake_up_charger() which takes charger_wakelock and blocks
+	 * deep sleep -> high screen-off drain (356mA) and suspend/resume
+	 * thrash (failed_resume) -> display fails to resume (backlight only). */
+	alarm_cancel(&info->charger_timer);
 
 	pdata1->disable_charging_count = 0;
 	pdata1->input_current_limit_by_aicl = -1;
