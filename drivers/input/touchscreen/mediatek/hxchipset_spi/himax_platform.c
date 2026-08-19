@@ -204,11 +204,9 @@ int himax_parse_dt(struct himax_ts_data *ts,
 	/* Set device tree data */
 	/* Set panel coordinates */
 	pdata->abs_x_min = hx_panel_coords[0];
-	/* tb8788p1: panel is used in landscape (ORIENTATION_90), swap X/Y
-	 * so abs_x_max=2176, abs_y_max=1600 to match the landscape display. */
-	pdata->abs_x_max = hx_panel_coords[3];
+	pdata->abs_x_max = hx_panel_coords[1];
 	pdata->abs_y_min = hx_panel_coords[2];
-	pdata->abs_y_max = hx_panel_coords[1];
+	pdata->abs_y_max = hx_panel_coords[3];
 	I(" %s:panel-coords = %d, %d, %d, %d\n", __func__,
 			pdata->abs_x_min,
 			pdata->abs_x_max,

@@ -2144,13 +2144,11 @@ int himax_parse_report_points(struct himax_ts_data *ts,
 	p_btn2 = hx_touch_data->hx_coord_buf[base + 9];
 	p_tilt_y = (int8_t)hx_touch_data->hx_coord_buf[base + 10];
 
-	/* tb8788p1: landscape (ORIENTATION_90) - rotate pen coords 90° to
-	 * match the landscape display (swap X/Y, flip new Y). */
-	{
-		int tmp = p_x;
-		p_x = p_y;
-		p_y = ts->pdata->abs_y_max - tmp;
-	}
+	/* tb8788p1: the touch sensor is mounted 180° relative to the
+	 * display; flip both axes (same as the TALIH reference driver's
+	 * tpd_rotate_180). */
+	p_x = ts->pdata->abs_x_max - p_x;
+	p_y = ts->pdata->abs_y_max - p_y;
 
 	if (g_ts_dbg != 0) {
 		D("%s: p_x=%d, p_y=%d, p_w=%d,p_tilt_x=%d, p_hover=%d\n",
@@ -2228,13 +2226,11 @@ skip_pen_operation:
 		w = hx_touch_data->hx_coord_buf[(ts->nFinger_support * 4)
 			+ loop_i];
 
-		/* tb8788p1: landscape (ORIENTATION_90) - rotate coords 90° to
-		 * match the landscape display (swap X/Y, flip new Y). */
-		{
-			int tmp = x;
-			x = y;
-			y = ts->pdata->abs_y_max - tmp;
-		}
+		/* tb8788p1: the touch sensor is mounted 180° relative to the
+		 * display; flip both axes (same as the TALIH reference
+		 * driver's tpd_rotate_180). */
+		x = ts->pdata->abs_x_max - x;
+		y = ts->pdata->abs_y_max - y;
 
 		if (g_ts_dbg != 0)
 			D("%s: now parsing[%d]:x=%d, y=%d, w=%d\n", __func__,
