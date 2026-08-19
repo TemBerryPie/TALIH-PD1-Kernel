@@ -847,6 +847,7 @@ static void lcm_it6112_replay(void)
 
 static void lcm_resume(void)
 {
+	pr_info("[Kernel/LCM] %s enter\n", __func__);
 	LCM_LOGI("[Kernel/LCM] %s enter\n", __func__);
 
 	/* tb8788p1: mirror the stock wake sequence exactly:
@@ -880,6 +881,7 @@ static void lcm_resume(void)
 		   ARRAY_SIZE(lcm_sleep_out_setting), 1);
 
 	lcm_set_gpio_output(LCM_GPIO_BL, GPIO_OUT_ONE);
+	pr_info("[Kernel/LCM] %s exit\n", __func__);
 	LCM_LOGI("[Kernel/LCM] %s exit\n", __func__);
 }
 

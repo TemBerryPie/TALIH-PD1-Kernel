@@ -5743,8 +5743,10 @@ int primary_display_resume(void)
 			 MMPROFILE_FLAG_START, 0, 0);
 
 	_primary_path_lock(__func__);
+	pr_info("[DISP diag] %s: state=%d power_mode=%d\n",
+		__func__, pgc->state, primary_display_get_power_mode_nolock());
 	if (pgc->state == DISP_ALIVE) {
-		DISPCHECK("primary display path is already resume, skip\n");
+		DISPPR_WARN("primary display path is already resume, skip\n");
 		goto done;
 	}
 	mmprofile_log_ex(ddp_mmp_get_events()->primary_resume,
@@ -5929,6 +5931,9 @@ int primary_display_resume(void)
 	} else if (primary_display_get_power_mode_nolock() == FB_RESUME) {
 		if (primary_display_get_lcm_power_state_nolock() != LCM_ON) {
 			DISPDBG("[POWER]lcm resume[begin]\n");
+			pr_info("[DISP diag] %s: disp_lcm_resume, power_mode=%d lcm_state=%d\n",
+				__func__, primary_display_get_power_mode_nolock(),
+				primary_display_get_lcm_power_state_nolock());
 			if (primary_display_get_lcm_power_state_nolock() !=
 			    LCM_ON_LOW_POWER) {
 				disp_lcm_resume(pgc->plcm);

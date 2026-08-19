@@ -2692,22 +2692,13 @@ static int mtkfb_suspend(struct platform_device *pdev, pm_message_t mesg)
 /* PM resume */
 static int mtkfb_resume(struct platform_device *pdev)
 {
-	int ret = 0;
-
 	NOT_REFERENCED(pdev);
 	MSG_FUNC_ENTER();
 	MTKFB_LOG("[FB Driver] %s()\n", __func__);
-	/* tb8788p1: system deep-sleep resume must restore the primary
-	 * display or the panel stays dark (backlight only) after a long
-	 * screen-off. mtkfb_suspend/mtkfb_resume were previously empty, so
-	 * the display never left the slept state on resume
-	 * (primary_display_trigger_nolock logged "skip because primary
-	 * display is slept"). */
-	if (disp_helper_get_stage() == DISP_HELPER_STAGE_NORMAL &&
-	    primary_display_is_sleepd())
-		ret = primary_display_resume();
+	pr_info("[FB Driver] %s() diag: stage=%d slept=%d\n",
+		__func__, disp_helper_get_stage(), primary_display_is_sleepd());
 	MSG_FUNC_LEAVE();
-	return ret;
+	return 0;
 }
 
 static void mtkfb_shutdown(struct platform_device *pdev)
