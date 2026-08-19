@@ -1496,46 +1496,6 @@ static const struct bpf_func_proto bpf_skb_load_bytes_proto = {
 	.arg4_type	= ARG_CONST_SIZE,
 };
 
-BPF_CALL_5(bpf_skb_load_bytes_relative, const struct sk_buff *, skb,
-	   u32, offset, void *, to, u32, len, u32, start_header)
-{
-	u32 start = skb_mac_header(skb) - skb->data;
-	u32 off;
-
-	if (unlikely(start_header == BPF_HDR_START_MAC))
-		start = skb_mac_header(skb) - skb->data;
-	else if (start_header == BPF_HDR_START_NET)
-		start = skb_network_header(skb) - skb->data;
-	else if (start_header == BPF_HDR_START_TRANSPORT)
-		start = skb_transport_header(skb) - skb->data;
-	else
-		return -EINVAL;
-
-	off = start + offset;
-
-	if (unlikely(off > 0xffff))
-		goto err_clear;
-
-	if (unlikely(skb_copy_bits(skb, off, to, len)))
-		goto err_clear;
-
-	return 0;
-err_clear:
-	memset(to, 0, len);
-	return -EFAULT;
-}
-
-static const struct bpf_func_proto bpf_skb_load_bytes_relative_proto = {
-	.func		= bpf_skb_load_bytes_relative,
-	.gpl_only	= false,
-	.ret_type	= RET_INTEGER,
-	.arg1_type	= ARG_PTR_TO_CTX,
-	.arg2_type	= ARG_ANYTHING,
-	.arg3_type	= ARG_PTR_TO_UNINIT_MEM,
-	.arg4_type	= ARG_CONST_SIZE,
-	.arg5_type	= ARG_ANYTHING,
-};
-
 BPF_CALL_2(bpf_skb_pull_data, struct sk_buff *, skb, u32, len)
 {
 	/* Idea is the following: should the needed direct read/write
@@ -3231,8 +3191,6 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_tail_call_proto;
 	case BPF_FUNC_ktime_get_ns:
 		return &bpf_ktime_get_ns_proto;
-	case BPF_FUNC_ktime_get_boot_ns:
-		return &bpf_ktime_get_boot_ns_proto;
 	case BPF_FUNC_trace_printk:
 		if (capable(CAP_SYS_ADMIN))
 			return bpf_get_trace_printk_proto();
@@ -3261,8 +3219,6 @@ sk_filter_func_proto(enum bpf_func_id func_id)
 	switch (func_id) {
 	case BPF_FUNC_skb_load_bytes:
 		return &bpf_skb_load_bytes_proto;
-	case BPF_FUNC_skb_load_bytes_relative:
-		return &bpf_skb_load_bytes_relative_proto;
 	case BPF_FUNC_get_socket_cookie:
 		return &bpf_get_socket_cookie_proto;
 	case BPF_FUNC_get_socket_uid:
@@ -3336,8 +3292,6 @@ tc_cls_act_func_proto(enum bpf_func_id func_id)
 		return &bpf_get_socket_cookie_proto;
 	case BPF_FUNC_get_socket_uid:
 		return &bpf_get_socket_uid_proto;
-	case BPF_FUNC_skb_load_bytes_relative:
-		return &bpf_skb_load_bytes_relative_proto;
 	default:
 		return bpf_base_func_proto(func_id);
 	}

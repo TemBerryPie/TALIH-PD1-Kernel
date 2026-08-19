@@ -681,8 +681,6 @@ union bpf_attr {
 	FN(redirect_map),		\
 	FN(sk_redirect_map),		\
 	FN(sock_map_update),		\
-	FN(skb_load_bytes_relative),	\
-	FN(ktime_get_boot_ns),		\
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call
@@ -736,11 +734,6 @@ enum bpf_func_id {
 enum bpf_adj_room_mode {
 	BPF_ADJ_ROOM_NET,
 };
-
-/* Start header for BPF_FUNC_skb_load_bytes_relative helper. */
-#define BPF_HDR_START_MAC	0
-#define BPF_HDR_START_NET	1
-#define BPF_HDR_START_TRANSPORT	2
 
 /* user accessible mirror of in-kernel sk_buff.
  * new fields can only be added to the end of this structure
