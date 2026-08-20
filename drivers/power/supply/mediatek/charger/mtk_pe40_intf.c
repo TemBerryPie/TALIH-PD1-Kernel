@@ -72,7 +72,7 @@ int mtk_pe40_pd_1st_request(struct charger_manager *pinfo,
 	chr_err("pe40_pd_req:vbus:%d ibus:%d input_current:%d %d\n",
 		adapter_mv, adapter_ma, ma, oldmA);
 
-	if (pinfo->data.parallel_vbus && (oldmA * 2 > ma)) {
+	if (is_dual_charger_supported(pinfo) && (oldmA * 2 > ma)) {
 		if (chg2_enable) {
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000 / 2);
@@ -81,13 +81,13 @@ int mtk_pe40_pd_1st_request(struct charger_manager *pinfo,
 		} else
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000);
-	} else if (pinfo->data.parallel_vbus == false && (oldmA > ma))
+	} else if (is_dual_charger_supported(pinfo) == false && (oldmA > ma))
 		charger_dev_set_input_current(pinfo->chg1_dev, ma * 1000);
 
 	ret = adapter_dev_set_cap(pinfo->pd_adapter, MTK_PD_APDO_START,
 		adapter_mv, adapter_ma);
 
-	if (pinfo->data.parallel_vbus && (oldmA * 2 < ma)) {
+	if (is_dual_charger_supported(pinfo) && (oldmA * 2 < ma)) {
 		if (chg2_enable) {
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000 / 2);
@@ -96,7 +96,7 @@ int mtk_pe40_pd_1st_request(struct charger_manager *pinfo,
 		} else
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000);
-	} else if (pinfo->data.parallel_vbus == false && (oldmA < ma))
+	} else if (is_dual_charger_supported(pinfo) == false && (oldmA < ma))
 		charger_dev_set_input_current(pinfo->chg1_dev, ma * 1000);
 
 	if ((adapter_mv - PE40_VBUS_IR_DROP_THRESHOLD) > mivr)
@@ -134,7 +134,7 @@ int mtk_pe40_pd_request(struct charger_manager *pinfo,
 	charger_dev_get_input_current(pinfo->chg1_dev, &oldmA);
 	oldmA = oldmA / 1000;
 
-	if (pinfo->data.parallel_vbus && (oldmA * 2 > ma)) {
+	if (is_dual_charger_supported(pinfo) && (oldmA * 2 > ma)) {
 		if (chg2_enable) {
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000 / 2);
@@ -143,7 +143,7 @@ int mtk_pe40_pd_request(struct charger_manager *pinfo,
 		} else
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000);
-	} else if (pinfo->data.parallel_vbus == false && (oldmA > ma))
+	} else if (is_dual_charger_supported(pinfo) == false && (oldmA > ma))
 		charger_dev_set_input_current(pinfo->chg1_dev, ma * 1000);
 
 	ret = adapter_dev_set_cap(pinfo->pd_adapter, MTK_PD_APDO,
@@ -175,7 +175,7 @@ int mtk_pe40_pd_request(struct charger_manager *pinfo,
 			goto err;
 	}
 
-	if (pinfo->data.parallel_vbus && (oldmA * 2 < ma)) {
+	if (is_dual_charger_supported(pinfo) && (oldmA * 2 < ma)) {
 		if (chg2_enable) {
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000 / 2);
@@ -184,7 +184,7 @@ int mtk_pe40_pd_request(struct charger_manager *pinfo,
 		} else
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000);
-	} else if (pinfo->data.parallel_vbus == false && (oldmA < ma))
+	} else if (is_dual_charger_supported(pinfo) == false && (oldmA < ma))
 		charger_dev_set_input_current(pinfo->chg1_dev, ma * 1000);
 
 	if ((adapter_mv - PE40_VBUS_IR_DROP_THRESHOLD) > mivr)
@@ -196,7 +196,7 @@ int mtk_pe40_pd_request(struct charger_manager *pinfo,
 	return ret;
 
 err:
-	if (pinfo->data.parallel_vbus && (oldmA * 2 > ma)) {
+	if (is_dual_charger_supported(pinfo) && (oldmA * 2 > ma)) {
 		if (chg2_enable) {
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000 / 2);
@@ -205,7 +205,7 @@ err:
 		} else
 			charger_dev_set_input_current(pinfo->chg1_dev,
 				ma * 1000);
-	} else if (pinfo->data.parallel_vbus == false && (oldmA > ma))
+	} else if (is_dual_charger_supported(pinfo) == false && (oldmA > ma))
 		charger_dev_set_input_current(pinfo->chg1_dev, ma * 1000);
 
 	mtk_pe40_set_mivr(pinfo, oldmivr);
@@ -432,7 +432,7 @@ int mtk_pe40_get_ibus(struct charger_manager *pinfo, u32 *ibus)
 	if (is_dual_charger_supported(pinfo) == true)
 		charger_dev_is_enabled(pinfo->chg2_dev, &is_enable);
 
-	if (pinfo->data.parallel_vbus) {
+	if (is_dual_charger_supported(pinfo)) {
 		ret = charger_dev_get_ibus(pinfo->chg1_dev, &chg1_ibus);
 
 		if (is_enable) {
@@ -1007,7 +1007,7 @@ int mtk_pe40_cc_state(struct charger_manager *pinfo)
 	icl = pinfo->chg1_data.input_current_limit / 1000 *
 		(100 - pinfo->data.ibus_err) / 100;
 
-	if (pinfo->data.parallel_vbus) {
+	if (is_dual_charger_supported(pinfo)) {
 		charger_dev_get_ibus(pinfo->chg1_dev, &compare_ibus);
 		compare_ibus = compare_ibus / 1000;
 
@@ -1044,7 +1044,7 @@ int mtk_pe40_cc_state(struct charger_manager *pinfo)
 		return 0;
 	}
 
-	if (pinfo->data.parallel_vbus) {
+	if (is_dual_charger_supported(pinfo)) {
 		if (pinfo->chg1_data.thermal_input_current_limit != -1 ||
 		    pinfo->chg2_data.thermal_input_current_limit != -1)
 			thermal_skip = true;
@@ -1058,7 +1058,7 @@ int mtk_pe40_cc_state(struct charger_manager *pinfo)
 
 		if (chg1_mivr || chg2_mivr) {
 			pe40->avbus = pe40->avbus + 50;
-			if (pinfo->data.parallel_vbus)
+			if (is_dual_charger_supported(pinfo))
 				new_watt = (pe40->avbus + 50) * icl * 2;
 			else
 				new_watt = (pe40->avbus + 50) * icl;
