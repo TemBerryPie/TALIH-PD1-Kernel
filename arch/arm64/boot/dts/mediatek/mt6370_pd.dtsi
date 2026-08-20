@@ -40,7 +40,7 @@
 			 *	MAX_POWER_LV = 0x21, MAX_POWER_LVIC = 0x31
 			 *	MAX_POWER_HV = 0x41, MAX_POWER_HVIC = 0x51
 			 */
-			pd,charging_policy= <0x31>;
+			pd,charging_policy= <0x51>;
 
 			/*
 			 * Fixed 5V, 500 mA <0x00019032>
@@ -58,8 +58,8 @@
 			 */
 			pd,source-pdo-size = <1>;
 			pd,source-pdo-data = <0x00019096>; /* 5V, 1500 mA */
-			pd,sink-pdo-size = <1>;
-			pd,sink-pdo-data = <0x000190c8>;
+			pd,sink-pdo-size = <2>;
+			pd,sink-pdo-data = <0x000190c8 0x0002d0c8>; /* 5V 2A, 9V 2A */
 
 			/*
 			 * No DP, host + device
