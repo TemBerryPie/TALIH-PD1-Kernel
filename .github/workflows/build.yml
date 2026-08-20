@@ -81,5 +81,6 @@ jobs:
           name: Image-TALIH-PD1
           path: |
             arch/arm64/boot/Image
+            arch/arm64/boot/dts/mediatek/mt6771.dtb
             vmlinux
             System.map
