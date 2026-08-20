@@ -805,7 +805,7 @@ static void lcm_it6112_replay(void)
 	struct i2c_adapter *adap;
 	struct i2c_msg msgs[2];
 	unsigned char rd_data;
-	int i, ret;
+	int i, ret, err_cnt = 0;
 
 	adap = i2c_get_adapter(3);
 	if (adap == NULL) {
@@ -839,10 +839,15 @@ static void lcm_it6112_replay(void)
 			msgs[0].buf = wbuf;
 			ret = i2c_transfer(adap, msgs, 1);
 		}
-		if (ret < 0 && i < 8)
-			LCM_LOGI("[Kernel/LCM] it6112: xfer %d failed %d\n", i, ret);
+		if (ret < 0) {
+			if (err_cnt < 8)
+				pr_info("[Kernel/LCM] it6112: xfer %d failed %d\n",
+					i, ret);
+			err_cnt++;
+		}
 	}
-	LCM_LOGI("[Kernel/LCM] it6112: replay done (%d xfers)\n", IT6112_SEQ_N);
+	pr_info("[Kernel/LCM] it6112: replay done (%d xfers, %d failed)\n",
+		IT6112_SEQ_N, err_cnt);
 }
 
 static void lcm_resume(void)
