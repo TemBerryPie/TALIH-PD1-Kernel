@@ -437,7 +437,7 @@ dual_swchg_select_charging_current_limit(struct charger_manager *info)
 	}
 
 done:
-	if (info->data.parallel_vbus) {
+	if (info->data.parallel_vbus && info->chg2_dev != NULL) {
 		pdata->input_current_limit = pdata->input_current_limit / 2;
 		pdata2->input_current_limit = pdata2->input_current_limit / 2;
 	}
@@ -653,7 +653,7 @@ static void dual_swchg_turn_on_charging(struct charger_manager *info)
 	charger_dev_is_enabled(info->chg2_dev, &chg2_enable);
 	charger_dev_is_chip_enabled(info->chg2_dev, &chg2_chip_enabled);
 
-	if (info->data.parallel_vbus) {
+	if (info->data.parallel_vbus && info->chg2_dev != NULL) {
 		if (!chg2_enable) {
 			charger_dev_set_input_current(info->chg1_dev,
 				info->chg1_data.input_current_limit * 2);
