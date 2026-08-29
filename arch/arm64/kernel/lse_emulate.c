@@ -172,11 +172,15 @@ static int lse_do_cas(struct pt_regs *regs, u32 insn)
 
 static int lse_handler(struct pt_regs *regs, u32 insn)
 {
+	pr_info("lse_handler: insn=0x%08x atomic=%d cas=%d\n",
+		insn,
+		(insn & LSE_ATOMIC_MASK) == LSE_ATOMIC_VAL,
+		(insn & CAS_MASK) == CAS_VAL);
 	if ((insn & LSE_ATOMIC_MASK) == LSE_ATOMIC_VAL)
 		return lse_do_atomic(regs, insn);
 	if ((insn & CAS_MASK) == CAS_VAL)
 		return lse_do_cas(regs, insn);
-	pr_info("user undef instr pc=0x%llx insn=0x%08x\n",
+	pr_info("lse_handler: unhandled pc=0x%llx insn=0x%08x\n",
 		(unsigned long long)instruction_pointer(regs), insn);
 	return 1;
 }
