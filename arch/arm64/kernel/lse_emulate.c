@@ -2,6 +2,7 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/printk.h>
 #include <linux/uaccess.h>
 
 #include <asm/ptrace.h>
@@ -65,6 +66,12 @@ static int lse_swp_handler(struct pt_regs *regs, u32 insn)
 	u64 old = 0;
 	int ret;
 
+	if ((insn & 0x3f208000) != 0x38208000) {
+		pr_info("user undef instr pc=0x%llx insn=0x%08x\n",
+			(unsigned long long)instruction_pointer(regs), insn);
+		return 1;
+	}
+
 	if (size > 3)
 		return 1;
 
@@ -97,8 +104,8 @@ static int lse_swp_handler(struct pt_regs *regs, u32 insn)
 }
 
 static struct undef_hook lse_swp_hook = {
-	.instr_mask	= 0x3f208000,
-	.instr_val	= 0x38208000,
+	.instr_mask	= 0,
+	.instr_val	= 0,
 	.pstate_mask	= PSR_MODE_MASK,
 	.pstate_val	= PSR_MODE_EL0t,
 	.fn		= lse_swp_handler,
