@@ -12,13 +12,13 @@
 #include <asm/traps.h>
 #include <asm/uaccess.h>
 
-/* LSE atomic memory op encoding: bits[29:23]=0001010 */
-#define LSE_ATOMIC_MASK  0x3f800000
+/* LSE atomic memory op: bits[29:24]=000101x (ignore a/r/l flags in bits[23:21]) */
+#define LSE_ATOMIC_MASK  0x3f200000
 #define LSE_ATOMIC_VAL   0x38200000
 
-/* CAS encoding: bits[29:23]=0010100 */
-#define CAS_MASK  0x3f800000
-#define CAS_VAL   0x08800000
+/* CAS: bits[29:24]=001000, bit[21]=1 (ignore a/r/l flags in bits[23:22]) */
+#define CAS_MASK  0x3f200000
+#define CAS_VAL   0x08200000
 
 #define LOOPS 128
 
