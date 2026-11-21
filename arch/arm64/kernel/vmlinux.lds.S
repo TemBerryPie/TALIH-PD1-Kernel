@@ -114,6 +114,15 @@ SECTIONS
 			__exception_text_start = .;
 			*(.exception.text)
 			__exception_text_end = .;
+			/*
+			 * LSE emulation LL/SC helper bodies: one contiguous
+			 * region so the fault/debug bridges can verify an
+			 * inner PC against real section boundary symbols
+			 * (arch/arm64/kernel/lse_emulate.c).
+			 */
+			__lse_emu_start = .;
+			KEEP(*(.text.lse_emu))
+			__lse_emu_end = .;
 			IRQENTRY_TEXT
 			SOFTIRQENTRY_TEXT
 			ENTRY_TEXT

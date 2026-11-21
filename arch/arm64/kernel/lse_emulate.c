@@ -29,12 +29,18 @@
  *    post-commit DMB ISH for the fully ordered (A+R) RMW/CAS/CASP forms;
  *  - every possibly-faulting instruction has an __ex_table entry; a fault
  *    during the attempt never commits anything and is forwarded as the
- *    original EL0 data abort (real FSC/FAR, EC=DABT_LOW, IL=1, ISV=0);
- *  - EL0 hardware watchpoints hit by the inner accesses abort the attempt
- *    the same way (the matched instruction has not executed and the memory
- *    location is Unchanged, ARM DDI 0487A D2.10.8); the event is reported
- *    once as SIGTRAP/TRAP_HWBKPT and the instruction is re-executed exactly
- *    once with the watchpoints suppressed so the commit is not lost;
+ *    original EL0 data abort: EC=DABT_LOW, IL=1, ISV=0 with the inner FSC
+ *    plus EA/FnV preserved (si_addr invalid when FnV=1, matching do_sea()
+ *    in this tree) and the logical WnR of the emulated access;
+ *  - EL0 hardware watchpoints hit by the inner accesses cancel the attempt
+ *    and are reported once per hit as SIGTRAP/TRAP_HWBKPT with the user PC
+ *    untouched: per ARM DDI 0487A D2.10.8 the matched instruction has not
+ *    executed and the memory location is Unchanged, so the instruction is
+ *    simply re-executed, and every re-execution that hits the watchpoint
+ *    again reports again -- exactly the behaviour of a native LL/SC
+ *    sequence under a watchpoint.  Watchpoints are never suppressed
+ *    (cancel = trap): no disable window, no restore bookkeeping, no way to
+ *    lose a commit; zero memory risk, correctness first;
  *  - illegal encodings are not intercepted (hook returns unhandled and the
  *    standard SIGILL/ILL_ILLOPC path runs with the PC left alone);
  *  - HWCAP_ATOMICS / HWCAP_LRCPC are NOT advertised and the ID registers
@@ -53,6 +59,7 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/string.h>
+#include <linux/stringify.h>
 #include <linux/uaccess.h>
 
 #include <asm/esr.h>
@@ -123,6 +130,27 @@ struct lse_emu_req {
 };
 
 /*
+ * struct lse_emu_req field offsets for the LL/SC helper bodies below: they
+ * are plain assembler routines (no C operands are available in bare
+ * file-scope asm) and address the request through x0 with these offsets.
+ * The values are pinned against the C layout by BUILD_BUG_ONs in
+ * lse_emulate_init() so the struct and the asm can never drift apart.
+ */
+#define LSE_REQ_OFF_ADDR	0	/* u64  masked user pointer      */
+#define LSE_REQ_OFF_SRC		8	/* u64  RMW source               */
+#define LSE_REQ_OFF_EXP		16	/* u64  CAS/CASP expected        */
+#define LSE_REQ_OFF_EXP1	24	/* u64  CASP64 expected high     */
+#define LSE_REQ_OFF_DES		32	/* u64  CAS/CASP desired         */
+#define LSE_REQ_OFF_DES1	40	/* u64  CASP64 desired high      */
+#define LSE_REQ_OFF_OLD		48	/* u64  out: old value           */
+#define LSE_REQ_OFF_OLD1	56	/* u64  out: CASP64 old high     */
+#define LSE_REQ_OFF_STATUS	64	/* u32  out: LSE_EMU_* status    */
+#define LSE_REQ_OFF_OP		68	/* u32  RMW op                   */
+#define LSE_REQ_OFF_A		72	/* u32  acquire flag             */
+#define LSE_REQ_OFF_R		76	/* u32  release flag             */
+#define LSE_REQ_OFF_AL		80	/* u32  A+R post-commit DMB flag */
+
+/*
  * Active emulation context.  `active` is set just before the bounded LL/SC
  * attempt and cleared again before preempt is re-enabled, so it never spans
  * a slow path; the narrow bridges in do_mem_abort()/do_debug_exception()
@@ -131,24 +159,22 @@ struct lse_emu_req {
 struct lse_emu_ctx {
 	u8	active;
 	u8	ev;		/* LSE_EMU_EV_* for the current attempt */
-	u32	esr;		/* inner syndrome (FSC) or debug ESR */
+	u32	esr;		/* full inner syndrome (FSC/EA/FnV or debug ESR) */
 	unsigned long addr;	/* data address (FAR) of the inner event */
 };
 static DEFINE_PER_CPU(struct lse_emu_ctx, lse_emu_ctx);
 
 /*
  * The LL/SC helper bodies below are the only code that may fault while the
- * context is active.  They are bracketed by assembler markers so the fault
- * bridge can verify the inner PC exactly; the bracket is validated at init
- * time against the helper entry points and emulation is disabled if the
- * compiler ever places anything in between.
+ * context is active.  They are emitted into their own dedicated section
+ * .text.lse_emu, which vmlinux.lds.S places contiguously with KEEP() between
+ * the exported boundary symbols __lse_emu_start/__lse_emu_end.  The fault
+ * and debug bridges verify the inner PC against those real section boundary
+ * symbols (no fragile assembler markers), and the bracket is validated at
+ * init time (lse_emu_layout_ok): emulation is disabled if the section does
+ * not contain exactly the 13 helper entries and their extable sites.
  */
-extern char __lse_emu_text_start[], __lse_emu_text_end[];
-
-asm(".pushsection .text\n"
-    ".align	2\n"
-    "__lse_emu_text_start:\n"
-    ".popsection\n");
+extern char __lse_emu_start[], __lse_emu_end[];
 
 /* Forward declaration: no header carries this prototype in 4.14. */
 asmlinkage void do_mem_abort(unsigned long addr, unsigned int esr,
@@ -279,83 +305,126 @@ static inline u64 lse_emu_width_mask(u32 bytes)
 }
 
 /* ------------------------------------------------------------------ */
-/* LL/SC helpers (design §3.3).  One asm block per family/size; the   */
-/* acquire/release forms are selected inside the block so that the    */
-/* whole bounded batch stays one closed region with no C call, no     */
-/* spill and no barrier between the exclusive load and store.         */
+/* LL/SC helpers (design §3.3).  One bare-assembler body per          */
+/* family/size; the acquire/release forms are selected inside the     */
+/* body so that the whole bounded batch stays one closed region with  */
+/* no C call, no spill and no barrier between the exclusive load and  */
+/* store.                                                             */
 /* ------------------------------------------------------------------ */
 
-static noinline notrace void lse_emu_rmw_8(struct lse_emu_req *q)
-{
-	u32 old, val, st, status, t1, t2, cnt;
+/*
+ * The 13 helper bodies below are plain assembler routines that follow the
+ * AAPCS calling convention -- q arrives in x0, results are written back
+ * into the request fields, only caller-saved registers are touched and
+ * they return with ret -- so the C dispatch (lse_emu_attempt) calls them
+ * like ordinary functions and lse_emu_layout_ok() can take their entry
+ * addresses.  Being bare file-scope asm, each body addresses the request
+ * with the LSE_REQ_OFF_* offsets and a fixed register map (documented per
+ * body); no compiler-allocated operands exist at file scope.
+ *
+ * Every body is emitted into the dedicated .text.lse_emu section
+ * (.pushsection ... .popsection) and carries its own __ex_table entries
+ * (61..64 -> the per-block 65: fixup site), so a faulting inner access is
+ * always redirected to the same block's fixup, which performs no user
+ * memory access.
+ */
+void lse_emu_rmw_8_body(struct lse_emu_req *q);
+void lse_emu_rmw_16_body(struct lse_emu_req *q);
+void lse_emu_rmw_32_body(struct lse_emu_req *q);
+void lse_emu_rmw_64_body(struct lse_emu_req *q);
+void lse_emu_cas_8_body(struct lse_emu_req *q);
+void lse_emu_cas_16_body(struct lse_emu_req *q);
+void lse_emu_cas_32_body(struct lse_emu_req *q);
+void lse_emu_cas_64_body(struct lse_emu_req *q);
+void lse_emu_casp_64_body(struct lse_emu_req *q);
+void lse_emu_ldapr_8_body(struct lse_emu_req *q);
+void lse_emu_ldapr_16_body(struct lse_emu_req *q);
+void lse_emu_ldapr_32_body(struct lse_emu_req *q);
+void lse_emu_ldapr_64_body(struct lse_emu_req *q);
 
-	asm volatile(
+/*
+ * RMW, 8/16/32-bit: one register map for the three 32-bit forms.
+ *   x1 addr, w2 op, w3 af, w4 rf, w5 al, w6 src, w7 old, w8 val,
+ *   w9 st, w10 status, w11 t1, w12 t2, w13 cnt
+ * Ops 4..7 (signed/unsigned max/min) need sign extension only for the
+ * byte and halfword forms; 32/64-bit compare directly.
+ */
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_rmw_8_body\n"
+	"lse_emu_rmw_8_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_OP) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_SRC) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxrb	%w[old], [%[addr]]\n"
+	"	mov	w13, #16\n"
+	"1:	cbz	w3, 2f\n"
+	"61:	ldaxrb	w7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxrb	%w[old], [%[addr]]\n"
-	"4:	cmp	%w[op], #0\n"
+	"62:	ldxrb	w7, [x1]\n"
+	"4:	cmp	w2, #0\n"
 	"	b.eq	40f\n"
-	"	cmp	%w[op], #1\n"
+	"	cmp	w2, #1\n"
 	"	b.eq	41f\n"
-	"	cmp	%w[op], #2\n"
+	"	cmp	w2, #2\n"
 	"	b.eq	42f\n"
-	"	cmp	%w[op], #3\n"
+	"	cmp	w2, #3\n"
 	"	b.eq	43f\n"
-	"	cmp	%w[op], #4\n"
+	"	cmp	w2, #4\n"
 	"	b.eq	44f\n"
-	"	cmp	%w[op], #5\n"
+	"	cmp	w2, #5\n"
 	"	b.eq	45f\n"
-	"	cmp	%w[op], #6\n"
+	"	cmp	w2, #6\n"
 	"	b.eq	46f\n"
-	"	cmp	%w[op], #7\n"
+	"	cmp	w2, #7\n"
 	"	b.eq	47f\n"
-	"	mov	%w[val], %w[src]\n"
+	"	mov	w8, w6\n"
 	"	b	6f\n"
-	"40:	add	%w[val], %w[old], %w[src]\n"
+	"40:	add	w8, w7, w6\n"
 	"	b	6f\n"
-	"41:	bic	%w[val], %w[old], %w[src]\n"
+	"41:	bic	w8, w7, w6\n"
 	"	b	6f\n"
-	"42:	eor	%w[val], %w[old], %w[src]\n"
+	"42:	eor	w8, w7, w6\n"
 	"	b	6f\n"
-	"43:	orr	%w[val], %w[old], %w[src]\n"
+	"43:	orr	w8, w7, w6\n"
 	"	b	6f\n"
-	"44:	sxtb	%w[t1], %w[old]\n"
-	"	sxtb	%w[t2], %w[src]\n"
-	"	cmp	%w[t1], %w[t2]\n"
-	"	csel	%w[val], %w[old], %w[src], ge\n"
+	"44:	sxtb	w11, w7\n"
+	"	sxtb	w12, w6\n"
+	"	cmp	w11, w12\n"
+	"	csel	w8, w7, w6, ge\n"
 	"	b	6f\n"
-	"45:	sxtb	%w[t1], %w[old]\n"
-	"	sxtb	%w[t2], %w[src]\n"
-	"	cmp	%w[t1], %w[t2]\n"
-	"	csel	%w[val], %w[old], %w[src], le\n"
+	"45:	sxtb	w11, w7\n"
+	"	sxtb	w12, w6\n"
+	"	cmp	w11, w12\n"
+	"	csel	w8, w7, w6, le\n"
 	"	b	6f\n"
-	"46:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], hs\n"
+	"46:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, hs\n"
 	"	b	6f\n"
-	"47:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], ls\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxrb	%w[st], %w[val], [%[addr]]\n"
+	"47:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, ls\n"
+	"6:	cbz	w4, 8f\n"
+	"63:	stlxrb	w9, w8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxrb	%w[st], %w[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxrb	w9, w8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w5, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w13, w13, #1\n"
+	"	cbnz	w13, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -365,89 +434,89 @@ static noinline notrace void lse_emu_rmw_8(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [t1] "=&r" (t1), [t2] "=&r" (t2),
-	  [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [src] "r" ((u32)q->src), [op] "r" (q->op),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
+	"	str	w7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_rmw_8_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_rmw_8);
-
-static noinline notrace void lse_emu_rmw_16(struct lse_emu_req *q)
-{
-	u32 old, val, st, status, t1, t2, cnt;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_rmw_16_body\n"
+	"lse_emu_rmw_16_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_OP) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_SRC) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxrh	%w[old], [%[addr]]\n"
+	"	mov	w13, #16\n"
+	"1:	cbz	w3, 2f\n"
+	"61:	ldaxrh	w7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxrh	%w[old], [%[addr]]\n"
-	"4:	cmp	%w[op], #0\n"
+	"62:	ldxrh	w7, [x1]\n"
+	"4:	cmp	w2, #0\n"
 	"	b.eq	40f\n"
-	"	cmp	%w[op], #1\n"
+	"	cmp	w2, #1\n"
 	"	b.eq	41f\n"
-	"	cmp	%w[op], #2\n"
+	"	cmp	w2, #2\n"
 	"	b.eq	42f\n"
-	"	cmp	%w[op], #3\n"
+	"	cmp	w2, #3\n"
 	"	b.eq	43f\n"
-	"	cmp	%w[op], #4\n"
+	"	cmp	w2, #4\n"
 	"	b.eq	44f\n"
-	"	cmp	%w[op], #5\n"
+	"	cmp	w2, #5\n"
 	"	b.eq	45f\n"
-	"	cmp	%w[op], #6\n"
+	"	cmp	w2, #6\n"
 	"	b.eq	46f\n"
-	"	cmp	%w[op], #7\n"
+	"	cmp	w2, #7\n"
 	"	b.eq	47f\n"
-	"	mov	%w[val], %w[src]\n"
+	"	mov	w8, w6\n"
 	"	b	6f\n"
-	"40:	add	%w[val], %w[old], %w[src]\n"
+	"40:	add	w8, w7, w6\n"
 	"	b	6f\n"
-	"41:	bic	%w[val], %w[old], %w[src]\n"
+	"41:	bic	w8, w7, w6\n"
 	"	b	6f\n"
-	"42:	eor	%w[val], %w[old], %w[src]\n"
+	"42:	eor	w8, w7, w6\n"
 	"	b	6f\n"
-	"43:	orr	%w[val], %w[old], %w[src]\n"
+	"43:	orr	w8, w7, w6\n"
 	"	b	6f\n"
-	"44:	sxth	%w[t1], %w[old]\n"
-	"	sxth	%w[t2], %w[src]\n"
-	"	cmp	%w[t1], %w[t2]\n"
-	"	csel	%w[val], %w[old], %w[src], ge\n"
+	"44:	sxth	w11, w7\n"
+	"	sxth	w12, w6\n"
+	"	cmp	w11, w12\n"
+	"	csel	w8, w7, w6, ge\n"
 	"	b	6f\n"
-	"45:	sxth	%w[t1], %w[old]\n"
-	"	sxth	%w[t2], %w[src]\n"
-	"	cmp	%w[t1], %w[t2]\n"
-	"	csel	%w[val], %w[old], %w[src], le\n"
+	"45:	sxth	w11, w7\n"
+	"	sxth	w12, w6\n"
+	"	cmp	w11, w12\n"
+	"	csel	w8, w7, w6, le\n"
 	"	b	6f\n"
-	"46:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], hs\n"
+	"46:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, hs\n"
 	"	b	6f\n"
-	"47:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], ls\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxrh	%w[st], %w[val], [%[addr]]\n"
+	"47:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, ls\n"
+	"6:	cbz	w4, 8f\n"
+	"63:	stlxrh	w9, w8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxrh	%w[st], %w[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxrh	w9, w8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w5, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w13, w13, #1\n"
+	"	cbnz	w13, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -457,85 +526,85 @@ static noinline notrace void lse_emu_rmw_16(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [t1] "=&r" (t1), [t2] "=&r" (t2),
-	  [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [src] "r" ((u32)q->src), [op] "r" (q->op),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
+	"	str	w7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_rmw_16_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_rmw_16);
-
-static noinline notrace void lse_emu_rmw_32(struct lse_emu_req *q)
-{
-	u32 old, val, st, status, t1, t2, cnt;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_rmw_32_body\n"
+	"lse_emu_rmw_32_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_OP) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_SRC) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxr	%w[old], [%[addr]]\n"
+	"	mov	w13, #16\n"
+	"1:	cbz	w3, 2f\n"
+	"61:	ldaxr	w7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxr	%w[old], [%[addr]]\n"
-	"4:	cmp	%w[op], #0\n"
+	"62:	ldxr	w7, [x1]\n"
+	"4:	cmp	w2, #0\n"
 	"	b.eq	40f\n"
-	"	cmp	%w[op], #1\n"
+	"	cmp	w2, #1\n"
 	"	b.eq	41f\n"
-	"	cmp	%w[op], #2\n"
+	"	cmp	w2, #2\n"
 	"	b.eq	42f\n"
-	"	cmp	%w[op], #3\n"
+	"	cmp	w2, #3\n"
 	"	b.eq	43f\n"
-	"	cmp	%w[op], #4\n"
+	"	cmp	w2, #4\n"
 	"	b.eq	44f\n"
-	"	cmp	%w[op], #5\n"
+	"	cmp	w2, #5\n"
 	"	b.eq	45f\n"
-	"	cmp	%w[op], #6\n"
+	"	cmp	w2, #6\n"
 	"	b.eq	46f\n"
-	"	cmp	%w[op], #7\n"
+	"	cmp	w2, #7\n"
 	"	b.eq	47f\n"
-	"	mov	%w[val], %w[src]\n"
+	"	mov	w8, w6\n"
 	"	b	6f\n"
-	"40:	add	%w[val], %w[old], %w[src]\n"
+	"40:	add	w8, w7, w6\n"
 	"	b	6f\n"
-	"41:	bic	%w[val], %w[old], %w[src]\n"
+	"41:	bic	w8, w7, w6\n"
 	"	b	6f\n"
-	"42:	eor	%w[val], %w[old], %w[src]\n"
+	"42:	eor	w8, w7, w6\n"
 	"	b	6f\n"
-	"43:	orr	%w[val], %w[old], %w[src]\n"
+	"43:	orr	w8, w7, w6\n"
 	"	b	6f\n"
-	"44:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], ge\n"
+	"44:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, ge\n"
 	"	b	6f\n"
-	"45:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], le\n"
+	"45:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, le\n"
 	"	b	6f\n"
-	"46:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], hs\n"
+	"46:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, hs\n"
 	"	b	6f\n"
-	"47:	cmp	%w[old], %w[src]\n"
-	"	csel	%w[val], %w[old], %w[src], ls\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxr	%w[st], %w[val], [%[addr]]\n"
+	"47:	cmp	w7, w6\n"
+	"	csel	w8, w7, w6, ls\n"
+	"6:	cbz	w4, 8f\n"
+	"63:	stlxr	w9, w8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxr	%w[st], %w[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxr	w9, w8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w5, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w13, w13, #1\n"
+	"	cbnz	w13, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -545,86 +614,89 @@ static noinline notrace void lse_emu_rmw_32(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [t1] "=&r" (t1), [t2] "=&r" (t2),
-	  [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [src] "r" ((u32)q->src), [op] "r" (q->op),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
+	"	str	w7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_rmw_32_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_rmw_32);
-
-static noinline notrace void lse_emu_rmw_64(struct lse_emu_req *q)
-{
-	u64 old, val;
-	u32 st, status, cnt;
-
-	asm volatile(
+/*
+ * RMW, 64-bit: x1 addr, x2 src, w3 op, w4 af, w5 rf, w6 al, x7 old,
+ * x8 val, w9 st, w10 status, w11 cnt.
+ */
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_rmw_64_body\n"
+	"lse_emu_rmw_64_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	x2, [x0, #" __stringify(LSE_REQ_OFF_SRC) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_OP) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxr	%[old], [%[addr]]\n"
+	"	mov	w11, #16\n"
+	"1:	cbz	w4, 2f\n"
+	"61:	ldaxr	x7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxr	%[old], [%[addr]]\n"
-	"4:	cmp	%w[op], #0\n"
+	"62:	ldxr	x7, [x1]\n"
+	"4:	cmp	w3, #0\n"
 	"	b.eq	40f\n"
-	"	cmp	%w[op], #1\n"
+	"	cmp	w3, #1\n"
 	"	b.eq	41f\n"
-	"	cmp	%w[op], #2\n"
+	"	cmp	w3, #2\n"
 	"	b.eq	42f\n"
-	"	cmp	%w[op], #3\n"
+	"	cmp	w3, #3\n"
 	"	b.eq	43f\n"
-	"	cmp	%w[op], #4\n"
+	"	cmp	w3, #4\n"
 	"	b.eq	44f\n"
-	"	cmp	%w[op], #5\n"
+	"	cmp	w3, #5\n"
 	"	b.eq	45f\n"
-	"	cmp	%w[op], #6\n"
+	"	cmp	w3, #6\n"
 	"	b.eq	46f\n"
-	"	cmp	%w[op], #7\n"
+	"	cmp	w3, #7\n"
 	"	b.eq	47f\n"
-	"	mov	%[val], %[src]\n"
+	"	mov	x8, x2\n"
 	"	b	6f\n"
-	"40:	add	%[val], %[old], %[src]\n"
+	"40:	add	x8, x7, x2\n"
 	"	b	6f\n"
-	"41:	bic	%[val], %[old], %[src]\n"
+	"41:	bic	x8, x7, x2\n"
 	"	b	6f\n"
-	"42:	eor	%[val], %[old], %[src]\n"
+	"42:	eor	x8, x7, x2\n"
 	"	b	6f\n"
-	"43:	orr	%[val], %[old], %[src]\n"
+	"43:	orr	x8, x7, x2\n"
 	"	b	6f\n"
-	"44:	cmp	%[old], %[src]\n"
-	"	csel	%[val], %[old], %[src], ge\n"
+	"44:	cmp	x7, x2\n"
+	"	csel	x8, x7, x2, ge\n"
 	"	b	6f\n"
-	"45:	cmp	%[old], %[src]\n"
-	"	csel	%[val], %[old], %[src], le\n"
+	"45:	cmp	x7, x2\n"
+	"	csel	x8, x7, x2, le\n"
 	"	b	6f\n"
-	"46:	cmp	%[old], %[src]\n"
-	"	csel	%[val], %[old], %[src], hs\n"
+	"46:	cmp	x7, x2\n"
+	"	csel	x8, x7, x2, hs\n"
 	"	b	6f\n"
-	"47:	cmp	%[old], %[src]\n"
-	"	csel	%[val], %[old], %[src], ls\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxr	%w[st], %[val], [%[addr]]\n"
+	"47:	cmp	x7, x2\n"
+	"	csel	x8, x7, x2, ls\n"
+	"6:	cbz	w5, 8f\n"
+	"63:	stlxr	w9, x8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxr	%w[st], %[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxr	w9, x8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w6, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w11, w11, #1\n"
+	"	cbnz	w11, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -634,16 +706,12 @@ static noinline notrace void lse_emu_rmw_64(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [src] "r" (q->src), [op] "r" (q->op),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
-
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_rmw_64);
+	"	str	x7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_rmw_64_body);
 
 /*
  * CAS scalar, all widths; also used for CASP with sz=0 where the pair is
@@ -652,39 +720,47 @@ NOKPROBE_SYMBOL(lse_emu_rmw_64);
  * A compare failure still writes the old value back through the exclusive
  * store: the write permission check and the store event must not be skipped
  * (design §2.2/§3.4).
+ *
+ * 8/16/32-bit: x1 addr, w2 af, w3 rf, w4 al, w5 exp, w6 des, w7 old,
+ * w8 val, w9 st, w10 status, w11 cnt.
  */
-static noinline notrace void lse_emu_cas_8(struct lse_emu_req *q)
-{
-	u32 old, val, st, status, cnt;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_cas_8_body\n"
+	"lse_emu_cas_8_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_EXP) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_DES) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxrb	%w[old], [%[addr]]\n"
+	"	mov	w11, #16\n"
+	"1:	cbz	w2, 2f\n"
+	"61:	ldaxrb	w7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxrb	%w[old], [%[addr]]\n"
-	"4:	cmp	%w[old], %w[exp]\n"
-	"	csel	%w[val], %w[des], %w[old], eq\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxrb	%w[st], %w[val], [%[addr]]\n"
+	"62:	ldxrb	w7, [x1]\n"
+	"4:	cmp	w7, w5\n"
+	"	csel	w8, w6, w7, eq\n"
+	"6:	cbz	w3, 8f\n"
+	"63:	stlxrb	w9, w8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxrb	%w[st], %w[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxrb	w9, w8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w4, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w11, w11, #1\n"
+	"	cbnz	w11, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -694,49 +770,50 @@ static noinline notrace void lse_emu_cas_8(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [exp] "r" ((u32)q->exp), [des] "r" ((u32)q->des),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
+	"	str	w7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_cas_8_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_cas_8);
-
-static noinline notrace void lse_emu_cas_16(struct lse_emu_req *q)
-{
-	u32 old, val, st, status, cnt;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_cas_16_body\n"
+	"lse_emu_cas_16_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_EXP) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_DES) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxrh	%w[old], [%[addr]]\n"
+	"	mov	w11, #16\n"
+	"1:	cbz	w2, 2f\n"
+	"61:	ldaxrh	w7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxrh	%w[old], [%[addr]]\n"
-	"4:	cmp	%w[old], %w[exp]\n"
-	"	csel	%w[val], %w[des], %w[old], eq\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxrh	%w[st], %w[val], [%[addr]]\n"
+	"62:	ldxrh	w7, [x1]\n"
+	"4:	cmp	w7, w5\n"
+	"	csel	w8, w6, w7, eq\n"
+	"6:	cbz	w3, 8f\n"
+	"63:	stlxrh	w9, w8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxrh	%w[st], %w[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxrh	w9, w8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w4, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w11, w11, #1\n"
+	"	cbnz	w11, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -746,49 +823,50 @@ static noinline notrace void lse_emu_cas_16(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [exp] "r" ((u32)q->exp), [des] "r" ((u32)q->des),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
+	"	str	w7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_cas_16_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_cas_16);
-
-static noinline notrace void lse_emu_cas_32(struct lse_emu_req *q)
-{
-	u32 old, val, st, status, cnt;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_cas_32_body\n"
+	"lse_emu_cas_32_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	w5, [x0, #" __stringify(LSE_REQ_OFF_EXP) "]\n"
+	"	ldr	w6, [x0, #" __stringify(LSE_REQ_OFF_DES) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxr	%w[old], [%[addr]]\n"
+	"	mov	w11, #16\n"
+	"1:	cbz	w2, 2f\n"
+	"61:	ldaxr	w7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxr	%w[old], [%[addr]]\n"
-	"4:	cmp	%w[old], %w[exp]\n"
-	"	csel	%w[val], %w[des], %w[old], eq\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxr	%w[st], %w[val], [%[addr]]\n"
+	"62:	ldxr	w7, [x1]\n"
+	"4:	cmp	w7, w5\n"
+	"	csel	w8, w6, w7, eq\n"
+	"6:	cbz	w3, 8f\n"
+	"63:	stlxr	w9, w8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxr	%w[st], %w[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxr	w9, w8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w4, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w11, w11, #1\n"
+	"	cbnz	w11, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -798,51 +876,55 @@ static noinline notrace void lse_emu_cas_32(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [exp] "r" ((u32)q->exp), [des] "r" ((u32)q->des),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
+	"	str	w7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_cas_32_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_cas_32);
-
-/* CAS 64-bit / CASP 2x32 (pair emulated as one 64-bit transaction). */
-static noinline notrace void lse_emu_cas_64(struct lse_emu_req *q)
-{
-	u64 old, val;
-	u32 st, status, cnt;
-
-	asm volatile(
+/*
+ * CAS 64-bit / CASP 2x32 (pair emulated as one 64-bit transaction).
+ * x1 addr, w2 af, w3 rf, w4 al, x5 exp, x6 des, x7 old, x8 val,
+ * w9 st, w10 status, w11 cnt.
+ */
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_cas_64_body\n"
+	"lse_emu_cas_64_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	x5, [x0, #" __stringify(LSE_REQ_OFF_EXP) "]\n"
+	"	ldr	x6, [x0, #" __stringify(LSE_REQ_OFF_DES) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxr	%[old], [%[addr]]\n"
+	"	mov	w11, #16\n"
+	"1:	cbz	w2, 2f\n"
+	"61:	ldaxr	x7, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxr	%[old], [%[addr]]\n"
-	"4:	cmp	%[old], %[exp]\n"
-	"	csel	%[val], %[des], %[old], eq\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxr	%w[st], %[val], [%[addr]]\n"
+	"62:	ldxr	x7, [x1]\n"
+	"4:	cmp	x7, x5\n"
+	"	csel	x8, x6, x7, eq\n"
+	"6:	cbz	w3, 8f\n"
+	"63:	stlxr	w9, x8, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxr	%w[st], %[val], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxr	w9, x8, [x1]\n"
+	"9:	cbnz	w9, 20f\n"
+	"	cbz	w4, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w10, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w11, w11, #1\n"
+	"	cbnz	w11, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w10, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w10, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -852,62 +934,69 @@ static noinline notrace void lse_emu_cas_64(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [val] "=&r" (val), [st] "=&r" (st),
-	  [status] "=&r" (status), [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [exp] "r" (q->exp), [des] "r" (q->des),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
-
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_cas_64);
+	"	str	x7, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w10, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_cas_64_body);
 
 /*
  * CASP with sz=1: 2x64, 16-byte aligned, 128-bit footprint.  v8.0 LDXP is
  * not a single-copy atomic load, so a mismatch is answered by a same-value
  * STXP whose success validates the whole 128-bit reservation before the
  * old pair is reported (design §3.4: the validation may not be skipped).
+ *
+ * x1 addr, w2 af, w3 rf, w4 al, x5 exp0 (then mismatch flag t1),
+ * x6 exp1 (then mismatch flag t2), x7 des0, x8 des1, x9 old0, x10 old1,
+ * x11 val0, x12 val1, w13 st, w14 status, w15 cnt.  exp0/exp1 are dead
+ * after their compares, so they double as the mismatch flags.
  */
-static noinline notrace void lse_emu_casp_64(struct lse_emu_req *q)
-{
-	u64 old0, old1, val0, val1, t1, t2;
-	u32 st, status, cnt;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_casp_64_body\n"
+	"lse_emu_casp_64_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
+	"	ldr	w2, [x0, #" __stringify(LSE_REQ_OFF_A) "]\n"
+	"	ldr	w3, [x0, #" __stringify(LSE_REQ_OFF_R) "]\n"
+	"	ldr	w4, [x0, #" __stringify(LSE_REQ_OFF_AL) "]\n"
+	"	ldr	x5, [x0, #" __stringify(LSE_REQ_OFF_EXP) "]\n"
+	"	ldr	x6, [x0, #" __stringify(LSE_REQ_OFF_EXP1) "]\n"
+	"	ldr	x7, [x0, #" __stringify(LSE_REQ_OFF_DES) "]\n"
+	"	ldr	x8, [x0, #" __stringify(LSE_REQ_OFF_DES1) "]\n"
 	"	clrex\n"
-	"	mov	%w[cnt], #16\n"
-	"1:	cbz	%w[af], 2f\n"
-	"61:	ldaxp	%[old0], %[old1], [%[addr]]\n"
+	"	mov	w15, #16\n"
+	"1:	cbz	w2, 2f\n"
+	"61:	ldaxp	x9, x10, [x1]\n"
 	"	b	4f\n"
 	"2:\n"
-	"62:	ldxp	%[old0], %[old1], [%[addr]]\n"
-	"4:	cmp	%[old0], %[exp0]\n"
-	"	cset	%[t1], ne\n"
-	"	cmp	%[old1], %[exp1]\n"
-	"	cset	%[t2], ne\n"
-	"	orr	%[t1], %[t1], %[t2]\n"
-	"	cmp	%[t1], xzr\n"
-	"	csel	%[val0], %[des0], %[old0], eq\n"
-	"	csel	%[val1], %[des1], %[old1], eq\n"
-	"6:	cbz	%w[rf], 8f\n"
-	"63:	stlxp	%w[st], %[val0], %[val1], [%[addr]]\n"
+	"62:	ldxp	x9, x10, [x1]\n"
+	"4:	cmp	x9, x5\n"
+	"	cset	x5, ne\n"
+	"	cmp	x10, x6\n"
+	"	cset	x6, ne\n"
+	"	orr	x5, x5, x6\n"
+	"	cmp	x5, xzr\n"
+	"	csel	x11, x7, x9, eq\n"
+	"	csel	x12, x8, x10, eq\n"
+	"6:	cbz	w3, 8f\n"
+	"63:	stlxp	w13, x11, x12, [x1]\n"
 	"	b	9f\n"
 	"8:\n"
-	"64:	stxp	%w[st], %[val0], %[val1], [%[addr]]\n"
-	"9:	cbnz	%w[st], 20f\n"
-	"	cbz	%w[al], 21f\n"
+	"64:	stxp	w13, x11, x12, [x1]\n"
+	"9:	cbnz	w13, 20f\n"
+	"	cbz	w4, 21f\n"
 	"	dmb	ish\n"
 	"21:	clrex\n"
-	"	mov	%w[status], #1\n"
+	"	mov	w14, #1\n"
 	"	b	99f\n"
-	"20:	sub	%w[cnt], %w[cnt], #1\n"
-	"	cbnz	%w[cnt], 1b\n"
+	"20:	sub	w15, w15, #1\n"
+	"	cbnz	w15, 1b\n"
 	"	clrex\n"
-	"	mov	%w[status], #2\n"
+	"	mov	w14, #2\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w14, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
@@ -917,132 +1006,115 @@ static noinline notrace void lse_emu_casp_64(struct lse_emu_req *q)
 	"	.long	63b - ., 65b - .\n"
 	"	.long	64b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old0] "=&r" (old0), [old1] "=&r" (old1), [val0] "=&r" (val0),
-	  [val1] "=&r" (val1), [t1] "=&r" (t1), [t2] "=&r" (t2),
-	  [st] "=&r" (st), [status] "=&r" (status), [cnt] "=&r" (cnt)
-	: [addr] "r" (q->addr), [exp0] "r" (q->exp), [exp1] "r" (q->exp1),
-	  [des0] "r" (q->des), [des1] "r" (q->des1),
-	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc", "memory");
-
-	q->old = old0;
-	q->old1 = old1;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_casp_64);
+	"	str	x9, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	x10, [x0, #" __stringify(LSE_REQ_OFF_OLD1) "]\n"
+	"	str	w14, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_casp_64_body);
 
 /*
- * LDAPR -> LDAR of the same width (RCsc strengthening, design §3.2).
- * Single load, no retry loop, no write of any kind.
+ * LDAPR -> LDAR of the same width (RCpc acquire strengthening, design
+ * §3.2).  Single load, no retry loop, no write of any kind.
+ * 8/16/32-bit: x1 addr, w2 old, w3 status.
  */
-static noinline notrace void lse_emu_ldapr_8(struct lse_emu_req *q)
-{
-	u32 old, status;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_ldapr_8_body\n"
+	"lse_emu_ldapr_8_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
 	"	clrex\n"
-	"61:	ldarb	%w[old], [%[addr]]\n"
-	"	mov	%w[status], #1\n"
+	"61:	ldarb	w2, [x1]\n"
+	"	mov	w3, #1\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w3, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
 	"	.align	3\n"
 	"	.long	61b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [status] "=&r" (status)
-	: [addr] "r" (q->addr)
-	: "cc", "memory");
+	"	str	w2, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w3, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_ldapr_8_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_ldapr_8);
-
-static noinline notrace void lse_emu_ldapr_16(struct lse_emu_req *q)
-{
-	u32 old, status;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_ldapr_16_body\n"
+	"lse_emu_ldapr_16_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
 	"	clrex\n"
-	"61:	ldarh	%w[old], [%[addr]]\n"
-	"	mov	%w[status], #1\n"
+	"61:	ldarh	w2, [x1]\n"
+	"	mov	w3, #1\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w3, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
 	"	.align	3\n"
 	"	.long	61b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [status] "=&r" (status)
-	: [addr] "r" (q->addr)
-	: "cc", "memory");
+	"	str	w2, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w3, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_ldapr_16_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_ldapr_16);
-
-static noinline notrace void lse_emu_ldapr_32(struct lse_emu_req *q)
-{
-	u32 old, status;
-
-	asm volatile(
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_ldapr_32_body\n"
+	"lse_emu_ldapr_32_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
 	"	clrex\n"
-	"61:	ldar	%w[old], [%[addr]]\n"
-	"	mov	%w[status], #1\n"
+	"61:	ldar	w2, [x1]\n"
+	"	mov	w3, #1\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w3, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
 	"	.align	3\n"
 	"	.long	61b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [status] "=&r" (status)
-	: [addr] "r" (q->addr)
-	: "cc", "memory");
+	"	str	w2, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w3, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_ldapr_32_body);
 
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_ldapr_32);
-
-static noinline notrace void lse_emu_ldapr_64(struct lse_emu_req *q)
-{
-	u64 old;
-	u32 status;
-
-	asm volatile(
+/* LDAPR 64-bit: x1 addr, x2 old, w3 status. */
+asm(".pushsection .text.lse_emu, \"ax\"\n"
+	".align	2\n"
+	".globl	lse_emu_ldapr_64_body\n"
+	"lse_emu_ldapr_64_body:\n"
+	"	ldr	x1, [x0, #" __stringify(LSE_REQ_OFF_ADDR) "]\n"
 	"	clrex\n"
-	"61:	ldar	%[old], [%[addr]]\n"
-	"	mov	%w[status], #1\n"
+	"61:	ldar	x2, [x1]\n"
+	"	mov	w3, #1\n"
 	"	b	99f\n"
 	"65:	clrex\n"
-	"	mov	%w[status], #3\n"
+	"	mov	w3, #3\n"
 	"	b	99f\n"
 	"99:\n"
 	"	.pushsection __ex_table, \"a\"\n"
 	"	.align	3\n"
 	"	.long	61b - ., 65b - .\n"
 	"	.popsection\n"
-	: [old] "=&r" (old), [status] "=&r" (status)
-	: [addr] "r" (q->addr)
-	: "cc", "memory");
-
-	q->old = old;
-	q->status = status;
-}
-NOKPROBE_SYMBOL(lse_emu_ldapr_64);
-
-asm(".pushsection .text\n"
-    "__lse_emu_text_end:\n"
-    ".popsection\n");
+	"	str	x2, [x0, #" __stringify(LSE_REQ_OFF_OLD) "]\n"
+	"	str	w3, [x0, #" __stringify(LSE_REQ_OFF_STATUS) "]\n"
+	"	ret\n"
+	".popsection\n"
+	);
+NOKPROBE_SYMBOL(lse_emu_ldapr_64_body);
 
 /* Run one bounded attempt batch with the helper selected by the decode. */
 static notrace void lse_emu_attempt(struct lse_emu_req *q,
@@ -1051,30 +1123,30 @@ static notrace void lse_emu_attempt(struct lse_emu_req *q,
 	switch (d->fam) {
 	case LSE_FAM_RMW:
 		switch (d->size) {
-		case 0: lse_emu_rmw_8(q);  return;
-		case 1: lse_emu_rmw_16(q); return;
-		case 2: lse_emu_rmw_32(q); return;
-		default: lse_emu_rmw_64(q); return;
+		case 0: lse_emu_rmw_8_body(q);  return;
+		case 1: lse_emu_rmw_16_body(q); return;
+		case 2: lse_emu_rmw_32_body(q); return;
+		default: lse_emu_rmw_64_body(q); return;
 		}
 	case LSE_FAM_CAS:
 		switch (d->size) {
-		case 0: lse_emu_cas_8(q);  return;
-		case 1: lse_emu_cas_16(q); return;
-		case 2: lse_emu_cas_32(q); return;
-		default: lse_emu_cas_64(q); return;
+		case 0: lse_emu_cas_8_body(q);  return;
+		case 1: lse_emu_cas_16_body(q); return;
+		case 2: lse_emu_cas_32_body(q); return;
+		default: lse_emu_cas_64_body(q); return;
 		}
 	case LSE_FAM_CASP:
 		if (d->size == 0)
-			lse_emu_cas_64(q);	/* pair as one 64-bit op */
+			lse_emu_cas_64_body(q);	/* pair as one 64-bit op */
 		else
-			lse_emu_casp_64(q);
+			lse_emu_casp_64_body(q);
 		return;
 	default:
 		switch (d->size) {
-		case 0: lse_emu_ldapr_8(q);  return;
-		case 1: lse_emu_ldapr_16(q); return;
-		case 2: lse_emu_ldapr_32(q); return;
-		default: lse_emu_ldapr_64(q); return;
+		case 0: lse_emu_ldapr_8_body(q);  return;
+		case 1: lse_emu_ldapr_16_body(q); return;
+		case 2: lse_emu_ldapr_32_body(q); return;
+		default: lse_emu_ldapr_64_body(q); return;
 		}
 	}
 }
@@ -1090,16 +1162,18 @@ static inline struct lse_emu_ctx *lse_emu_this_ctx(void)
 
 static inline bool lse_emu_pc_in_helpers(unsigned long pc)
 {
-	return (unsigned long)__lse_emu_text_start <= pc &&
-	       pc < (unsigned long)__lse_emu_text_end;
+	return (unsigned long)__lse_emu_start <= pc &&
+	       pc < (unsigned long)__lse_emu_end;
 }
 
 /*
  * Narrow fault bridge (design §4.2): called from do_mem_abort() for
  * kernel-mode data aborts.  Only when the emulation context is active and
  * the inner PC sits on one of the helper's exact extable sites do we
- * capture the syndrome and redirect to the attempt fixup; every other
- * exception keeps the original path.
+ * capture the full syndrome (FSC plus EA/FnV and every other ISS field of
+ * the inner abort -- the handler masks it down to the architecturally
+ * meaningful fields on reassembly) and redirect to the attempt fixup;
+ * every other exception keeps the original path.
  */
 int lse_emu_mem_abort_hook(unsigned long addr, unsigned int esr,
 			   struct pt_regs *regs)
@@ -1168,24 +1242,39 @@ static bool lse_emu_el0_wp_covers(unsigned long addr)
 /*
  * Narrow debug bridge (design §6): called from do_debug_exception() for
  * kernel-mode debug exceptions.  A data watchpoint can match the inner
- * EL1 access performed on behalf of the emulated instruction.
+ * EL1 access performed on behalf of the emulated instruction (the same
+ * "uaccess routine hits a user watchpoint" case watchpoint_report()
+ * already knows about).
  *
- * Per ARM DDI 0487A D2.10.8 the preferred return address of a watchpoint
- * exception is the address of the instruction that generated it, and the
- * memory location is Unchanged: for an exclusive store the store has NOT
- * taken place.  There is therefore no committed side to salvage and no
- * PC to skip: both load-side (WnR=0) and store-side (WnR=1) hits abort
- * the attempt via the exact extable fixup with status FAULT + ev DEBUG
- * (P0-2).  The handler reports the event once (SIGTRAP/TRAP_HWBKPT, data
- * address, PC untouched) while the EL0 watchpoints stay suppressed, so
- * the single re-execution of the instruction runs to a verified commit
- * and the commit path restores the watchpoints.
+ * Cancel = trap (design simplification, round-2 review): per ARM DDI
+ * 0487A D2.10.8 the preferred return address of a watchpoint exception is
+ * the address of the instruction that generated it and the memory
+ * location is Unchanged -- for an exclusive store the store has NOT taken
+ * place.  There is nothing to salvage and no committed side, so the
+ * attempt is cancelled: the bridge verifies the exact extable site and
+ * redirects the helper to the per-block fixup (65:), which issues CLREX
+ * -- abandoning the exclusive monitor -- and sets status=FAULT with no
+ * register or memory side effect, i.e. the helper state is rolled back
+ * completely to before the un-executed instruction.  The handler then
+ * reports the event through the standard user debug path
+ * (SIGTRAP/TRAP_HWBKPT with the data address) leaving the user PC
+ * untouched, so the emulated instruction is re-executed.
+ *
+ * Trade-off: a watchpoint placed on LSE-hot code produces an event
+ * (SIGTRAP) on every re-execution that hits it -- the same stream a
+ * native LDXR/STXR sequence produces under a watchpoint -- instead of the
+ * previous suppress-and-re-execute-once scheme.  The suppression
+ * machinery (wps_disabled bookkeeping plus the restore call on every one
+ * of the eight emulation exits) is gone: there is no window in which user
+ * watchpoints are disabled, no lifecycle to get wrong, and no way for a
+ * cancelled commit to be mistaken for a completed one.  Zero memory risk;
+ * correctness first.
  *
  * The bridge consumes the event only when every gate matches (P1-c:
  * never swallow a foreign event):
- *  - the emulation context is active and the inner PC sits between the
- *    assembler markers (the inner access is an EL1 access performed on
- *    behalf of the user task only while that window is open);
+ *  - the emulation context is active and the inner PC lies inside the
+ *    .text.lse_emu section (the inner access is an EL1 access performed
+ *    on behalf of the user task only while that window is open);
  *  - the exception is a data watchpoint (EC == WATCHPT_CUR);
  *  - the fired address falls inside one of the current task's
  *    EL0-privilege watchpoints (lse_emu_el0_wp_covers) -- events of
@@ -1212,18 +1301,18 @@ int lse_emu_debug_hook(unsigned long addr, unsigned int esr,
 		return 0;
 
 	/*
-	 * Redirect the helper to the attempt fixup first, then record the
-	 * event and suppress the watchpoints: the fixup lands on the 65:
-	 * site which performs no memory access, so nothing can re-trigger
-	 * between the fixup and the suppression.
+	 * Redirect the helper to the attempt fixup first: the fixup lands
+	 * on the 65: site which performs no user memory access (CLREX and
+	 * status only), so nothing can re-trigger before the event is
+	 * recorded.  On failure the exception keeps the original debug
+	 * path.
 	 */
 	if (!fixup_exception(regs))
-		return 0;		/* no fixup: keep the original debug path */
+		return 0;
 
 	WRITE_ONCE(ctx->addr, addr);
 	WRITE_ONCE(ctx->esr, esr);
 	WRITE_ONCE(ctx->ev, LSE_EMU_EV_DEBUG);
-	lse_emu_wp_suppress();
 	return 1;
 #else
 	return 0;
@@ -1267,11 +1356,16 @@ static bool lse_emu_check_vma(struct mm_struct *mm, unsigned long addr,
 	}
 
 	/*
-	 * RMW/CAS/CASP are logical read+write: require write permission
-	 * (on arm64 a writable PTE is readable, so VM_WRITE alone may be
-	 * sufficient - do not mechanically require VM_READ).  LDAPR is a
-	 * pure read.  A compare failure or a ZR source does not waive the
-	 * permission requirements.
+	 * Read side (LDAPR, or the load half of RMW/CAS/CASP): allow
+	 * VM_READ or VM_EXEC.  That is the same set this tree's
+	 * do_page_fault() admits for an EL0 data read fault
+	 * (vm_flags = VM_READ | VM_WRITE | VM_EXEC is its default for a
+	 * read abort): an exec-only user mapping gets a user-readable PTE
+	 * here, and a native LDAR/LDAXR on such a page would read it
+	 * fine, so the emulated load must be allowed to do the same.
+	 * Write side: require VM_WRITE, matching the WnR=1 fault the
+	 * inner exclusive store would take.  A compare failure or a ZR
+	 * source does not waive the permission requirements.
 	 */
 	if (write) {
 		if (!(vma->vm_flags & VM_WRITE)) {
@@ -1279,7 +1373,7 @@ static bool lse_emu_check_vma(struct mm_struct *mm, unsigned long addr,
 			*code = SEGV_ACCERR;
 			return false;
 		}
-	} else if (!(vma->vm_flags & (VM_READ | VM_WRITE))) {
+	} else if (!(vma->vm_flags & (VM_READ | VM_EXEC))) {
 		*sig = SIGSEGV;
 		*code = SEGV_ACCERR;
 		return false;
@@ -1318,12 +1412,8 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 	if (!user_mode(regs))
 		return 1;
 
-	if (!lse_emu_decode(insn, &d)) {
-		/* illegal encoding: standard SIGILL; drop any watchpoint
-		 * suppression a previous attempt window left behind (P1-b) */
-		lse_emu_wp_restore();
-		return 1;
-	}
+	if (!lse_emu_decode(insn, &d))
+		return 1;		/* illegal encoding: standard SIGILL */
 
 	perf_sw_event(PERF_COUNT_SW_EMULATION_FAULTS, 1, regs, regs->pc);
 
@@ -1343,20 +1433,17 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 
 	/* Natural alignment; CASP checks the whole pair. */
 	if (addr & (d.bytes - 1)) {
-		lse_emu_wp_restore();
 		lse_emu_force_sig(SIGBUS, BUS_ADRALN, addr, regs);
 		return 0;
 	}
 	/* SP alignment check when the base is SP and SCTLR_EL1.SA0 is set. */
 	if (d.rn == 31 && (read_sysreg(sctlr_el1) & SCTLR_EL1_SA0) &&
 	    (addr & 15)) {
-		lse_emu_wp_restore();
 		lse_emu_force_sig(SIGBUS, BUS_ADRALN, addr, regs);
 		return 0;
 	}
 	/* USER_DS range incl. overflow, then the CSDB-hardened pointer. */
 	if (!access_ok(VERIFY_WRITE, (void __user *)addr, d.bytes)) {
-		lse_emu_wp_restore();
 		lse_emu_force_sig(SIGSEGV, SEGV_MAPERR, addr, regs);
 		return 0;
 	}
@@ -1403,7 +1490,6 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		down_read(&mm->mmap_sem);
 		if (!lse_emu_check_vma(mm, addr, d.bytes, write, &sig, &code)) {
 			up_read(&mm->mmap_sem);
-			lse_emu_wp_restore();
 			lse_emu_force_sig(sig, code, addr, regs);
 			return 0;
 		}
@@ -1416,11 +1502,13 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 
 		ctx = lse_emu_this_ctx();
 		/*
-		 * P0-1: the helper asm blocks clobber "memory", so none of
-		 * these stores may be reordered into or past the LL/SC region
-		 * where a faulting inner access would otherwise observe a
-		 * torn or stale context; WRITE_ONCE/READ_ONCE keep the
-		 * cross-function contract explicit for the bridges.
+		 * P0-1: the helper bodies are opaque callee-saved-respecting
+		 * calls now, and the context fields are volatile (WRITE_ONCE/
+		 * READ_ONCE), so none of these stores may be reordered into
+		 * or past the LL/SC region where a faulting inner access
+		 * would otherwise observe a torn or stale context; the
+		 * READ_ONCE/WRITE_ONCE pair keeps the cross-function
+		 * contract explicit for the bridges.
 		 */
 		WRITE_ONCE(ctx->active, 1);
 		WRITE_ONCE(ctx->ev, LSE_EMU_EV_NONE);
@@ -1435,6 +1523,9 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		iaddr = READ_ONCE(ctx->addr);
 		WRITE_ONCE(ctx->active, 0);
 		WRITE_ONCE(ctx->ev, LSE_EMU_EV_NONE);
+		/* Clear the scratch fields so no inner-event data can leak. */
+		WRITE_ONCE(ctx->esr, 0);
+		WRITE_ONCE(ctx->addr, 0);
 
 		result = q.status;
 
@@ -1474,30 +1565,29 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 			}
 
 			/*
-			 * A debug event (load- or store-side) always aborts
-			 * the attempt via the extable fixup before anything
-			 * is committed (P0-2, ARM DDI 0487A D2.10.8), so a
-			 * verified commit either was never supervised or
-			 * belongs to the re-execution after the event was
-			 * reported once.  Advance PC normally and restore
-			 * the EL0 watchpoints suppressed for this window.
+			 * A debug event always cancels the attempt via the
+			 * extable fixup before anything is committed (see
+			 * lse_emu_debug_hook), so a verified commit belongs
+			 * to an execution no watchpoint fired on: advance PC
+			 * normally.  There is no watchpoint state to restore
+			 * -- the suppress/restore scheme is gone (F2).
 			 */
 			arm64_skip_faulting_instruction(regs, 4);
-			lse_emu_wp_restore();
 			return 0;
 		}
 
 		if (result == LSE_EMU_FAULT && ev == LSE_EMU_EV_DEBUG) {
 			/*
-			 * Load- or store-side watchpoint hit (P0-2): nothing
-			 * committed, the memory location is unchanged per ARM
-			 * DDI 0487A D2.10.8.  Report the event once with the
-			 * PC untouched; the watchpoints stay suppressed across
-			 * the exactly-once re-execution so no event is reported
-			 * twice, and the commit path restores them.  (P1-b
-			 * does not restore here: dropping the suppression at
-			 * this exit would make the re-execution re-report the
-			 * same hit forever without ever committing.)
+			 * Load- or store-side watchpoint hit: per ARM DDI
+			 * 0487A D2.10.8 the matched instruction has not
+			 * executed and the memory location is unchanged.
+			 * Report the event with the data address and the
+			 * user PC untouched: the instruction is re-executed
+			 * on return, and every re-execution that hits the
+			 * watchpoint again reports again -- exactly what a
+			 * native LL/SC sequence does under a watchpoint
+			 * (F2: cancel = trap; no suppression, no
+			 * exactly-once re-execution bookkeeping).
 			 */
 			lse_emu_force_sig(SIGTRAP, TRAP_HWBKPT, iaddr, regs);
 			return 0;
@@ -1505,32 +1595,39 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 
 		if (result == LSE_EMU_FAULT) {
 			/*
-			 * Forward as the original EL0 user abort: real
-			 * FSC/FAR from the inner fault, EC=DABT_LOW, IL=1,
-			 * ISV=0 (design §4.2).  WnR reflects the logical
+			 * Forward as the original EL0 user abort: EC=DABT_LOW,
+			 * IL=1, ISV=0 (design §4.2).  WnR reflects the logical
 			 * access so COW is resolved for RMW/CAS/CASP.
+			 *
+			 * F3: preserve EA and FnV from the inner ISS -- they
+			 * qualify external-abort reporting and si_addr
+			 * validity.  Every other ISS field (ISV, SAS, SRT,
+			 * SF, AR, CM, SET, ...) describes the helper's own
+			 * inner access, is scratch, and is masked off so no
+			 * helper state can leak into the user-visible abort.
+			 * FnV=1 means the FAR is invalid: pass 0 so the
+			 * forwarding matches this tree's do_sea() semantics
+			 * (si_addr = NULL when ESR_ELx_FnV is set).
 			 */
-			u32 esr = (ESR_ELx_EC_DABT_LOW << ESR_ELx_EC_SHIFT) |
-				  ESR_ELx_IL | (iesr & ESR_ELx_FSC);
+			u32 esr = ((u32)ESR_ELx_EC_DABT_LOW << ESR_ELx_EC_SHIFT) |
+				  (u32)ESR_ELx_IL;
+			unsigned long faddr = iaddr;
 
+			esr |= iesr & (ESR_ELx_FSC | ESR_ELx_EA | ESR_ELx_FnV);
 			if (write)
 				esr |= ESR_ELx_WNR;
-			do_mem_abort(iaddr, esr, regs);
+			if (iesr & ESR_ELx_FnV)
+				faddr = 0;
+			do_mem_abort(faddr, esr, regs);
 
-			if (signal_pending(current)) {
-				/* PC unchanged; retry by user (P1-b) */
-				lse_emu_wp_restore();
-				return 0;
-			}
+			if (signal_pending(current))
+				return 0;	/* PC unchanged; retry by user */
 			continue;
 		}
 
 		/* LSE_EMU_RETRY: batch exhausted, nothing committed. */
-		if (signal_pending(current)) {
-			/* PC unchanged; ret_to_user delivers (P1-b) */
-			lse_emu_wp_restore();
-			return 0;
-		}
+		if (signal_pending(current))
+			return 0;	/* PC unchanged; ret_to_user delivers */
 		cond_resched();
 	}
 }
@@ -1579,27 +1676,72 @@ static void __init lse_emu_hooks_init(void)
 	}
 }
 
-/* Verify the helper bodies really sit between the assembler markers. */
+/*
+ * Init-time layout validation: the LL/SC helper bodies must be the only
+ * code inside the dedicated .text.lse_emu section.
+ *
+ * Checks (against the section boundary symbols exported by vmlinux.lds.S):
+ *  - __lse_emu_start/__lse_emu_end are non-zero and start < end;
+ *  - each of the 13 helper entry symbols lies inside the section and the
+ *    entries are pairwise distinct (exactly 13 helper entries);
+ *  - every __ex_table entry whose faulting site lies in the section also
+ *    points to a fixup inside the section, and the site/fixup census is
+ *    exactly 40 sites (4 per RMW/CAS/CASP body: 61/62/63/64, 1 per LDAPR
+ *    body: 61) mapped to 13 distinct per-body fixup sites (65:).
+ */
 static bool __init lse_emu_layout_ok(void)
 {
 	static void (*const helpers[])(struct lse_emu_req *) = {
-		lse_emu_rmw_8, lse_emu_rmw_16, lse_emu_rmw_32, lse_emu_rmw_64,
-		lse_emu_cas_8, lse_emu_cas_16, lse_emu_cas_32, lse_emu_cas_64,
-		lse_emu_casp_64,
-		lse_emu_ldapr_8, lse_emu_ldapr_16, lse_emu_ldapr_32,
-		lse_emu_ldapr_64,
+		lse_emu_rmw_8_body, lse_emu_rmw_16_body,
+		lse_emu_rmw_32_body, lse_emu_rmw_64_body,
+		lse_emu_cas_8_body, lse_emu_cas_16_body,
+		lse_emu_cas_32_body, lse_emu_cas_64_body,
+		lse_emu_casp_64_body,
+		lse_emu_ldapr_8_body, lse_emu_ldapr_16_body,
+		lse_emu_ldapr_32_body, lse_emu_ldapr_64_body,
 	};
-	unsigned long start = (unsigned long)__lse_emu_text_start;
-	unsigned long end = (unsigned long)__lse_emu_text_end;
-	int i;
+	extern struct exception_table_entry __start___ex_table[];
+	extern struct exception_table_entry __stop___ex_table[];
+	unsigned long start = (unsigned long)__lse_emu_start;
+	unsigned long end = (unsigned long)__lse_emu_end;
+	unsigned long fixes[ARRAY_SIZE(helpers)];
+	struct exception_table_entry *e;
+	int i, j, nfix = 0, nsite = 0;
+
+	if (start == 0 || end == 0 || start >= end)
+		return false;
 
 	for (i = 0; i < ARRAY_SIZE(helpers); i++) {
 		unsigned long pc = (unsigned long)helpers[i];
 
 		if (pc < start || pc >= end)
 			return false;
+		for (j = 0; j < i; j++)
+			if (pc == (unsigned long)helpers[j])
+				return false;
 	}
-	return true;
+
+	for (e = __start___ex_table; e < __stop___ex_table; e++) {
+		/* ARCH_HAS_RELATIVE_EXTABLE: fields are section-relative. */
+		unsigned long site = (unsigned long)&e->insn + e->insn;
+		unsigned long fix = (unsigned long)&e->fixup + e->fixup;
+
+		if (site < start || site >= end)
+			continue;
+		nsite++;
+		if (fix < start || fix >= end)
+			return false;
+		for (j = 0; j < nfix; j++)
+			if (fixes[j] == fix)
+				break;
+		if (j == nfix) {
+			if (nfix == ARRAY_SIZE(fixes))
+				return false;	/* 14th distinct fixup */
+			fixes[nfix++] = fix;
+		}
+	}
+
+	return nsite == 40 && nfix == ARRAY_SIZE(helpers);
 }
 
 /* Diagnostic boot param: arm64.user_lse_emulation=on|off (default on). */
@@ -1617,6 +1759,38 @@ early_param("arm64.user_lse_emulation", lse_emu_param);
 
 static int __init lse_emulate_init(void)
 {
+	/*
+	 * The helper bodies address struct lse_emu_req fields by the
+	 * hardcoded LSE_REQ_OFF_* offsets; pin them against the C layout
+	 * at build time (the offsets are stringified into the asm).
+	 */
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, addr) !=
+		     LSE_REQ_OFF_ADDR);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, src) !=
+		     LSE_REQ_OFF_SRC);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, exp) !=
+		     LSE_REQ_OFF_EXP);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, exp1) !=
+		     LSE_REQ_OFF_EXP1);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, des) !=
+		     LSE_REQ_OFF_DES);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, des1) !=
+		     LSE_REQ_OFF_DES1);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, old) !=
+		     LSE_REQ_OFF_OLD);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, old1) !=
+		     LSE_REQ_OFF_OLD1);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, status) !=
+		     LSE_REQ_OFF_STATUS);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, op) !=
+		     LSE_REQ_OFF_OP);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, a) !=
+		     LSE_REQ_OFF_A);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, r) !=
+		     LSE_REQ_OFF_R);
+	BUILD_BUG_ON(__builtin_offsetof(struct lse_emu_req, al) !=
+		     LSE_REQ_OFF_AL);
+
 	if (!lse_emu_enabled) {
 		pr_info("LSE emulation disabled (arm64.user_lse_emulation=off)\n");
 		return 0;

@@ -19,15 +19,6 @@ int lse_emu_mem_abort_hook(unsigned long addr, unsigned int esr,
 int lse_emu_debug_hook(unsigned long addr, unsigned int esr,
 		       struct pt_regs *regs);
 
-#ifdef CONFIG_HAVE_HW_BREAKPOINT
-/* Watchpoint suppression for the debug bridge; hw_breakpoint.c. */
-void lse_emu_wp_suppress(void);
-void lse_emu_wp_restore(void);
-#else
-static inline void lse_emu_wp_suppress(void) {}
-static inline void lse_emu_wp_restore(void) {}
-#endif
-
 #else /* !CONFIG_ARM64_LSE_EMULATE */
 
 static inline int lse_emu_mem_abort_hook(unsigned long addr,
@@ -43,9 +34,6 @@ static inline int lse_emu_debug_hook(unsigned long addr,
 {
 	return 0;
 }
-
-static inline void lse_emu_wp_suppress(void) {}
-static inline void lse_emu_wp_restore(void) {}
 
 #endif /* CONFIG_ARM64_LSE_EMULATE */
 
