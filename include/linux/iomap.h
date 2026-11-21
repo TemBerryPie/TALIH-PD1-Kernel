@@ -34,15 +34,19 @@ struct vm_fault;
  * Magic value for blkno:
  */
 #define IOMAP_NULL_BLOCK -1LL	/* blkno is not valid */
+#define IOMAP_NULL_ADDR	(-1ULL)	/* addr is not valid */
+
+#define IOMAP_INLINE		0x05	/* data inline in the inode */
 
 struct iomap {
-	sector_t		blkno;	/* 1st sector of mapping, 512b units */
+	sector_t		addr;	/* 1st sector of mapping, 512b units */
 	loff_t			offset;	/* file offset of mapping, bytes */
 	u64			length;	/* length of mapping, bytes */
 	u16			type;	/* type of mapping */
 	u16			flags;	/* flags for mapping */
 	struct block_device	*bdev;	/* block device for I/O */
 	struct dax_device	*dax_dev; /* dax_dev for dax operations */
+	void			*inline_data;	/* data, if IOMAP_INLINE */
 };
 
 /*
@@ -73,6 +77,23 @@ struct iomap_ops {
 	int (*iomap_end)(struct inode *inode, loff_t pos, loff_t length,
 			ssize_t written, unsigned flags, struct iomap *iomap);
 };
+
+/*
+ * Structure allocate for each page when block size < PAGE_SIZE to track
+ * sub-page uptodate status and I/O completions.
+ */
+struct iomap_page {
+	atomic_t		read_count;
+	atomic_t		write_count;
+	DECLARE_BITMAP(uptodate, PAGE_SIZE / 512);
+};
+
+static inline struct iomap_page *to_iomap_page(struct page *page)
+{
+	if (page_has_private(page))
+		return (struct iomap_page *)page_private(page);
+	return NULL;
+}
 
 ssize_t iomap_file_buffered_write(struct kiocb *iocb, struct iov_iter *from,
 		const struct iomap_ops *ops);

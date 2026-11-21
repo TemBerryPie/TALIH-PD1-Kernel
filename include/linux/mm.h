@@ -2437,21 +2437,13 @@ void task_dirty_inc(struct task_struct *tsk);
 #define VM_MAX_READAHEAD	256	/* kbytes */
 #define VM_MIN_READAHEAD	16	/* kbytes (includes current page) */
 
-int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
+void force_page_cache_readahead(struct address_space *mapping, struct file *filp,
 			pgoff_t offset, unsigned long nr_to_read);
 
-void page_cache_sync_readahead(struct address_space *mapping,
-			       struct file_ra_state *ra,
-			       struct file *filp,
-			       pgoff_t offset,
-			       unsigned long size);
-
-void page_cache_async_readahead(struct address_space *mapping,
-				struct file_ra_state *ra,
-				struct file *filp,
-				struct page *pg,
-				pgoff_t offset,
-				unsigned long size);
+/*
+ * page_cache_sync_readahead()/page_cache_async_readahead() are static inlines
+ * in <linux/pagemap.h> (they call page_cache_sync_ra()/page_cache_async_ra()).
+ */
 
 extern unsigned long stack_guard_gap;
 /* Generic expand stack which grows the stack according to GROWS{UP,DOWN} */

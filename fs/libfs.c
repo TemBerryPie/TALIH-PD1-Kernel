@@ -1348,3 +1348,16 @@ void generic_set_encrypted_ci_d_ops(struct inode *dir, struct dentry *dentry)
 #endif
 }
 EXPORT_SYMBOL(generic_set_encrypted_ci_d_ops);
+
+ssize_t noop_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+{
+	/*
+	 * iomap based filesystems support direct I/O without need for
+	 * this callback. However, it still needs to be set in
+	 * inode->a_ops so that open/fcntl know that direct I/O is
+	 * generally supported.  (4.19 backport, EndCredits sm7250)
+	 */
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(noop_direct_IO);
+
