@@ -33,6 +33,7 @@
 #include <asm/current.h>
 #include <asm/debug-monitors.h>
 #include <asm/hw_breakpoint.h>
+#include <asm/lse_emulate.h>
 #include <asm/traps.h>
 #include <asm/cputype.h>
 #include <asm/system_misc.h>
@@ -910,6 +911,29 @@ int reinstall_suspended_bps(struct pt_regs *regs)
 	return !handled_exception;
 }
 NOKPROBE_SYMBOL(reinstall_suspended_bps);
+
+#ifdef CONFIG_ARM64_LSE_EMULATE
+/*
+ * Watchpoint suppression for the LSE emulation debug bridge: the helper's
+ * inner access matched an EL0 watchpoint, so the EL0 watchpoints are
+ * disabled (with the existing wps_disabled bookkeeping) until the emulated
+ * instruction has either committed (restore) or the re-executed instruction
+ * commits (restore on the next successful emulation).
+ */
+void lse_emu_wp_suppress(void)
+{
+	toggle_bp_registers(AARCH64_DBG_REG_WCR, DBG_ACTIVE_EL0, 0);
+	current->thread.debug.wps_disabled = 1;
+}
+
+void lse_emu_wp_restore(void)
+{
+	if (current->thread.debug.wps_disabled) {
+		current->thread.debug.wps_disabled = 0;
+		toggle_bp_registers(AARCH64_DBG_REG_WCR, DBG_ACTIVE_EL0, 1);
+	}
+}
+#endif
 
 /*
  * Context-switcher for restoring suspended breakpoints.

@@ -37,6 +37,7 @@
 #include <asm/cmpxchg.h>
 #include <asm/cpufeature.h>
 #include <asm/exception.h>
+#include <asm/lse_emulate.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
 #include <asm/kasan.h>
@@ -759,6 +760,14 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
 	const struct fault_info *inf = esr_to_fault_info(esr);
 	struct siginfo info;
 
+	/*
+	 * Narrow fault bridge for the LSE emulation attempt window: only
+	 * consumes the abort when the inner PC sits on an exact extable
+	 * site of the LL/SC helpers with the per-task context active.
+	 */
+	if (!user_mode(regs) && lse_emu_mem_abort_hook(addr, esr, regs))
+		return;
+
 	if (!inf->fn(addr, esr, regs))
 		return;
 
@@ -889,6 +898,17 @@ asmlinkage int __exception do_debug_exception(unsigned long addr,
 
 	if (user_mode(regs) && !is_ttbr0_addr(pc))
 		arm64_apply_bp_hardening();
+
+	/*
+	 * Narrow debug bridge for the LSE emulation attempt window: handles
+	 * EL0 watchpoints hit by the helper's inner accesses; everything
+	 * else keeps the original debug path.
+	 */
+	if (!user_mode(regs) && lse_emu_debug_hook(addr, esr, regs)) {
+		if (interrupts_enabled(regs))
+			trace_hardirqs_on();
+		return 1;
+	}
 
 	if (!inf->fn(addr, esr, regs)) {
 		rv = 1;

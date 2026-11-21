@@ -1003,6 +1003,27 @@ config ARM64_LSE_ATOMICS
 	  not support these instructions and requires the kernel to be
 	  built with binutils >= 2.25.
 
+config ARM64_LSE_EMULATE
+	bool "Emulate userland LSE atomics and LDAPR on ARMv8.0 cores"
+	depends on !ARM64_LSE_ATOMICS
+	help
+	  Emulates the ARMv8.1 LSE atomic instructions (LDADD/LDCLR/LDEOR/
+	  LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP/CAS/CASP) and the ARMv8.3
+	  LDAPR loads for AArch64 EL0 code running on cores that do not
+	  implement them, via the undefined-instruction trap with precise
+	  whitelisted decoding and hardware LL/SC (LDXR/STXR) helpers.
+
+	  The emulation is restricted to naturally aligned Normal
+	  Write-Back / Inner-Shareable user mappings; device or non-WB
+	  mappings are rejected with SIGBUS.  Illegal encodings keep the
+	  normal SIGILL behaviour, page faults are forwarded as the original
+	  EL0 data aborts, and no HWCAP bits are advertised.  A diagnostic
+	  boot parameter arm64.user_lse_emulation=off disables it at runtime.
+
+	  Say Y if userland binaries contain statically encoded LSE/LDAPR
+	  instructions (e.g. ARMv8.1-built donor binaries) and the CPUs are
+	  all ARMv8.0.  If unsure, say N.
+
 config ARM64_VHE
 	bool "Enable support for Virtualization Host Extensions (VHE)"
 	default n
