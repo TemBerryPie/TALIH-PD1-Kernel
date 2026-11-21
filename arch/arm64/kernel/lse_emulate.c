@@ -30,12 +30,18 @@
  *  - every possibly-faulting instruction has an __ex_table entry; a fault
  *    during the attempt never commits anything and is forwarded as the
  *    original EL0 data abort (real FSC/FAR, EC=DABT_LOW, IL=1, ISV=0);
+ *  - EL0 hardware watchpoints hit by the inner accesses abort the attempt
+ *    the same way (the matched instruction has not executed and the memory
+ *    location is Unchanged, ARM DDI 0487A D2.10.8); the event is reported
+ *    once as SIGTRAP/TRAP_HWBKPT and the instruction is re-executed exactly
+ *    once with the watchpoints suppressed so the commit is not lost;
  *  - illegal encodings are not intercepted (hook returns unhandled and the
  *    standard SIGILL/ILL_ILLOPC path runs with the PC left alone);
  *  - HWCAP_ATOMICS / HWCAP_LRCPC are NOT advertised and the ID registers
  *    are not modified: only statically-encoded sites trap here.
  */
 
+#include <linux/compiler.h>
 #include <linux/extable.h>
 #include <linux/hardirq.h>
 #include <linux/init.h>
@@ -364,7 +370,7 @@ static noinline notrace void lse_emu_rmw_8(struct lse_emu_req *q)
 	  [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [src] "r" ((u32)q->src), [op] "r" (q->op),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -456,7 +462,7 @@ static noinline notrace void lse_emu_rmw_16(struct lse_emu_req *q)
 	  [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [src] "r" ((u32)q->src), [op] "r" (q->op),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -544,7 +550,7 @@ static noinline notrace void lse_emu_rmw_32(struct lse_emu_req *q)
 	  [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [src] "r" ((u32)q->src), [op] "r" (q->op),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -632,7 +638,7 @@ static noinline notrace void lse_emu_rmw_64(struct lse_emu_req *q)
 	  [status] "=&r" (status), [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [src] "r" (q->src), [op] "r" (q->op),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -692,7 +698,7 @@ static noinline notrace void lse_emu_cas_8(struct lse_emu_req *q)
 	  [status] "=&r" (status), [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [exp] "r" ((u32)q->exp), [des] "r" ((u32)q->des),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -744,7 +750,7 @@ static noinline notrace void lse_emu_cas_16(struct lse_emu_req *q)
 	  [status] "=&r" (status), [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [exp] "r" ((u32)q->exp), [des] "r" ((u32)q->des),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -796,7 +802,7 @@ static noinline notrace void lse_emu_cas_32(struct lse_emu_req *q)
 	  [status] "=&r" (status), [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [exp] "r" ((u32)q->exp), [des] "r" ((u32)q->des),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -850,7 +856,7 @@ static noinline notrace void lse_emu_cas_64(struct lse_emu_req *q)
 	  [status] "=&r" (status), [cnt] "=&r" (cnt)
 	: [addr] "r" (q->addr), [exp] "r" (q->exp), [des] "r" (q->des),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -917,7 +923,7 @@ static noinline notrace void lse_emu_casp_64(struct lse_emu_req *q)
 	: [addr] "r" (q->addr), [exp0] "r" (q->exp), [exp1] "r" (q->exp1),
 	  [des0] "r" (q->des), [des1] "r" (q->des1),
 	  [af] "r" (q->a), [rf] "r" (q->r), [al] "r" (q->al)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old0;
 	q->old1 = old1;
@@ -948,7 +954,7 @@ static noinline notrace void lse_emu_ldapr_8(struct lse_emu_req *q)
 	"	.popsection\n"
 	: [old] "=&r" (old), [status] "=&r" (status)
 	: [addr] "r" (q->addr)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -974,7 +980,7 @@ static noinline notrace void lse_emu_ldapr_16(struct lse_emu_req *q)
 	"	.popsection\n"
 	: [old] "=&r" (old), [status] "=&r" (status)
 	: [addr] "r" (q->addr)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -1000,7 +1006,7 @@ static noinline notrace void lse_emu_ldapr_32(struct lse_emu_req *q)
 	"	.popsection\n"
 	: [old] "=&r" (old), [status] "=&r" (status)
 	: [addr] "r" (q->addr)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -1027,7 +1033,7 @@ static noinline notrace void lse_emu_ldapr_64(struct lse_emu_req *q)
 	"	.popsection\n"
 	: [old] "=&r" (old), [status] "=&r" (status)
 	: [addr] "r" (q->addr)
-	: "cc");
+	: "cc", "memory");
 
 	q->old = old;
 	q->status = status;
@@ -1100,29 +1106,59 @@ int lse_emu_mem_abort_hook(unsigned long addr, unsigned int esr,
 {
 	struct lse_emu_ctx *ctx = lse_emu_this_ctx();
 
-	if (!ctx->active || !lse_emu_pc_in_helpers(regs->pc) ||
+	if (!READ_ONCE(ctx->active) || !lse_emu_pc_in_helpers(regs->pc) ||
 	    !search_exception_tables(regs->pc))
 		return 0;
 
-	ctx->addr = addr;
-	ctx->esr = esr;
-	ctx->ev = LSE_EMU_EV_FAULT;
-	fixup_exception(regs);
+	WRITE_ONCE(ctx->addr, addr);
+	WRITE_ONCE(ctx->esr, esr);
+	WRITE_ONCE(ctx->ev, LSE_EMU_EV_FAULT);
+	/*
+	 * Consume the event only when the fixup really redirects this PC;
+	 * otherwise the abort keeps the original path (P1-c: never swallow
+	 * an event the bridge cannot handle).
+	 */
+	if (!fixup_exception(regs)) {
+		WRITE_ONCE(ctx->addr, 0);
+		WRITE_ONCE(ctx->esr, 0);
+		WRITE_ONCE(ctx->ev, LSE_EMU_EV_NONE);
+		return 0;
+	}
 	return 1;
 }
 NOKPROBE_SYMBOL(lse_emu_mem_abort_hook);
 
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
-/* True if this task has EL0-privilege hardware watchpoints installed. */
-static bool lse_emu_task_has_el0_wp(void)
+/*
+ * True when the fired data address falls inside one of the current
+ * task's EL0-privilege hardware watchpoints (same byte-range match as
+ * watchpoint_handler's get_distance_from_watchpoint()).  This both
+ * proves the task owns EL0 watchpoints and attributes the event to one
+ * of them: a hit of an EL1-privilege (kernel) watchpoint -- e.g. a task
+ * holding an EL0 and an EL1 watchpoint when the helper's inner access
+ * runs -- does not match here and keeps the original debug path instead
+ * of being swallowed by the bridge (P1-c).
+ */
+static bool lse_emu_el0_wp_covers(unsigned long addr)
 {
 	int i;
 
+	addr = untagged_addr(addr);
+
 	for (i = 0; i < ARM_MAX_WRP; i++) {
 		struct perf_event *wp = current->thread.debug.hbp_watch[i];
+		struct arch_hw_breakpoint *info;
+		u64 low, high;
 
-		if (wp && counter_arch_bp(wp)->ctrl.privilege ==
-			  AARCH64_BREAKPOINT_EL0)
+		if (!wp)
+			continue;
+		info = counter_arch_bp(wp);
+		if (info->ctrl.privilege != AARCH64_BREAKPOINT_EL0 ||
+		    !info->ctrl.enabled)
+			continue;
+		low  = info->address + __ffs(info->ctrl.len);
+		high = info->address + __fls(info->ctrl.len);
+		if (addr >= low && addr <= high)
 			return true;
 	}
 	return false;
@@ -1132,39 +1168,62 @@ static bool lse_emu_task_has_el0_wp(void)
 /*
  * Narrow debug bridge (design §6): called from do_debug_exception() for
  * kernel-mode debug exceptions.  A data watchpoint can match the inner
- * EL1 access performed on behalf of the emulated instruction.  The commit
- * must not be lost to the debug machinery:
- *  - store-side hit (WnR=1): the exclusive store has already completed
- *    (a failed STXR performs no access and matches nothing), so resume at
- *    pc+4 and let the helper finish the verified commit;
- *  - load-side hit (WnR=0): nothing has been committed; abort the attempt
- *    via the extable fixup and re-execute later with the watchpoints
- *    suppressed so no event is reported twice.
- * In both cases user watchpoints are suppressed/restored through the
- * existing wps_disabled machinery; non-watchpoint debug events and events
- * of tasks without EL0 watchpoints keep the original path.
+ * EL1 access performed on behalf of the emulated instruction.
+ *
+ * Per ARM DDI 0487A D2.10.8 the preferred return address of a watchpoint
+ * exception is the address of the instruction that generated it, and the
+ * memory location is Unchanged: for an exclusive store the store has NOT
+ * taken place.  There is therefore no committed side to salvage and no
+ * PC to skip: both load-side (WnR=0) and store-side (WnR=1) hits abort
+ * the attempt via the exact extable fixup with status FAULT + ev DEBUG
+ * (P0-2).  The handler reports the event once (SIGTRAP/TRAP_HWBKPT, data
+ * address, PC untouched) while the EL0 watchpoints stay suppressed, so
+ * the single re-execution of the instruction runs to a verified commit
+ * and the commit path restores the watchpoints.
+ *
+ * The bridge consumes the event only when every gate matches (P1-c:
+ * never swallow a foreign event):
+ *  - the emulation context is active and the inner PC sits between the
+ *    assembler markers (the inner access is an EL1 access performed on
+ *    behalf of the user task only while that window is open);
+ *  - the exception is a data watchpoint (EC == WATCHPT_CUR);
+ *  - the fired address falls inside one of the current task's
+ *    EL0-privilege watchpoints (lse_emu_el0_wp_covers) -- events of
+ *    tasks without EL0 watchpoints and hits of EL1-privilege watchpoints
+ *    keep the original debug path;
+ *  - the inner PC is an exact __ex_table site of the helpers and
+ *    fixup_exception() really redirects it.
+ * On any gate failure the exception keeps the original path with the
+ * context untouched.
  */
 int lse_emu_debug_hook(unsigned long addr, unsigned int esr,
 		       struct pt_regs *regs)
 {
 	struct lse_emu_ctx *ctx = lse_emu_this_ctx();
 
-	if (!ctx->active || !lse_emu_pc_in_helpers(regs->pc))
+	if (!READ_ONCE(ctx->active) || !lse_emu_pc_in_helpers(regs->pc))
 		return 0;
 	if (ESR_ELx_EC(esr) != ESR_ELx_EC_WATCHPT_CUR)
 		return 0;
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
-	if (!lse_emu_task_has_el0_wp())
+	if (!lse_emu_el0_wp_covers(addr))
+		return 0;
+	if (!search_exception_tables(regs->pc))
 		return 0;
 
+	/*
+	 * Redirect the helper to the attempt fixup first, then record the
+	 * event and suppress the watchpoints: the fixup lands on the 65:
+	 * site which performs no memory access, so nothing can re-trigger
+	 * between the fixup and the suppression.
+	 */
+	if (!fixup_exception(regs))
+		return 0;		/* no fixup: keep the original debug path */
+
+	WRITE_ONCE(ctx->addr, addr);
+	WRITE_ONCE(ctx->esr, esr);
+	WRITE_ONCE(ctx->ev, LSE_EMU_EV_DEBUG);
 	lse_emu_wp_suppress();
-	ctx->addr = addr;
-	ctx->esr = esr;
-	ctx->ev = LSE_EMU_EV_DEBUG;
-	if (esr & AARCH64_ESR_ACCESS_MASK)	/* store-side: store done */
-		regs->pc += 4;
-	else
-		fixup_exception(regs);		/* load-side: abort */
 	return 1;
 #else
 	return 0;
@@ -1259,8 +1318,12 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 	if (!user_mode(regs))
 		return 1;
 
-	if (!lse_emu_decode(insn, &d))
-		return 1;		/* illegal encoding: standard SIGILL */
+	if (!lse_emu_decode(insn, &d)) {
+		/* illegal encoding: standard SIGILL; drop any watchpoint
+		 * suppression a previous attempt window left behind (P1-b) */
+		lse_emu_wp_restore();
+		return 1;
+	}
 
 	perf_sw_event(PERF_COUNT_SW_EMULATION_FAULTS, 1, regs, regs->pc);
 
@@ -1280,17 +1343,20 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 
 	/* Natural alignment; CASP checks the whole pair. */
 	if (addr & (d.bytes - 1)) {
+		lse_emu_wp_restore();
 		lse_emu_force_sig(SIGBUS, BUS_ADRALN, addr, regs);
 		return 0;
 	}
 	/* SP alignment check when the base is SP and SCTLR_EL1.SA0 is set. */
 	if (d.rn == 31 && (read_sysreg(sctlr_el1) & SCTLR_EL1_SA0) &&
 	    (addr & 15)) {
+		lse_emu_wp_restore();
 		lse_emu_force_sig(SIGBUS, BUS_ADRALN, addr, regs);
 		return 0;
 	}
 	/* USER_DS range incl. overflow, then the CSDB-hardened pointer. */
 	if (!access_ok(VERIFY_WRITE, (void __user *)addr, d.bytes)) {
+		lse_emu_wp_restore();
 		lse_emu_force_sig(SIGSEGV, SEGV_MAPERR, addr, regs);
 		return 0;
 	}
@@ -1337,6 +1403,7 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		down_read(&mm->mmap_sem);
 		if (!lse_emu_check_vma(mm, addr, d.bytes, write, &sig, &code)) {
 			up_read(&mm->mmap_sem);
+			lse_emu_wp_restore();
 			lse_emu_force_sig(sig, code, addr, regs);
 			return 0;
 		}
@@ -1348,19 +1415,26 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		uaccess_enable();
 
 		ctx = lse_emu_this_ctx();
-		ctx->active = 1;
-		ctx->ev = LSE_EMU_EV_NONE;
-		ctx->esr = 0;
-		ctx->addr = 0;
+		/*
+		 * P0-1: the helper asm blocks clobber "memory", so none of
+		 * these stores may be reordered into or past the LL/SC region
+		 * where a faulting inner access would otherwise observe a
+		 * torn or stale context; WRITE_ONCE/READ_ONCE keep the
+		 * cross-function contract explicit for the bridges.
+		 */
+		WRITE_ONCE(ctx->active, 1);
+		WRITE_ONCE(ctx->ev, LSE_EMU_EV_NONE);
+		WRITE_ONCE(ctx->esr, 0);
+		WRITE_ONCE(ctx->addr, 0);
 
 		lse_emu_attempt(&q, &d);
 
 		/* Copy the bridge state out before leaving the window. */
-		ev = ctx->ev;
-		iesr = ctx->esr;
-		iaddr = ctx->addr;
-		ctx->active = 0;
-		ctx->ev = LSE_EMU_EV_NONE;
+		ev = READ_ONCE(ctx->ev);
+		iesr = READ_ONCE(ctx->esr);
+		iaddr = READ_ONCE(ctx->addr);
+		WRITE_ONCE(ctx->active, 0);
+		WRITE_ONCE(ctx->ev, LSE_EMU_EV_NONE);
 
 		result = q.status;
 
@@ -1399,36 +1473,31 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 				break;
 			}
 
-			if (ev == LSE_EMU_EV_DEBUG) {
-				/*
-				 * Store-side watchpoint hit: the exclusive
-				 * store already committed, the helper just
-				 * verified it.  Advance PC manually (do not
-				 * clear the single-step state) and forward
-				 * the debug event with the data address.
-				 */
-				regs->pc += 4;
-				lse_emu_wp_restore();
-				lse_emu_force_sig(SIGTRAP, TRAP_HWBKPT,
-						  iaddr, regs);
-			} else {
-				arm64_skip_faulting_instruction(regs, 4);
-				/*
-				 * If a load-side watchpoint suppressed the
-				 * EL0 watchpoints earlier (event forwarded,
-				 * instruction re-executed), the commit is
-				 * now done: restore them immediately.
-				 */
-				lse_emu_wp_restore();
-			}
+			/*
+			 * A debug event (load- or store-side) always aborts
+			 * the attempt via the extable fixup before anything
+			 * is committed (P0-2, ARM DDI 0487A D2.10.8), so a
+			 * verified commit either was never supervised or
+			 * belongs to the re-execution after the event was
+			 * reported once.  Advance PC normally and restore
+			 * the EL0 watchpoints suppressed for this window.
+			 */
+			arm64_skip_faulting_instruction(regs, 4);
+			lse_emu_wp_restore();
 			return 0;
 		}
 
 		if (result == LSE_EMU_FAULT && ev == LSE_EMU_EV_DEBUG) {
 			/*
-			 * Load-side watchpoint hit: nothing committed, PC
-			 * untouched, watchpoints stay suppressed until the
-			 * (re-)execution of this instruction commits.
+			 * Load- or store-side watchpoint hit (P0-2): nothing
+			 * committed, the memory location is unchanged per ARM
+			 * DDI 0487A D2.10.8.  Report the event once with the
+			 * PC untouched; the watchpoints stay suppressed across
+			 * the exactly-once re-execution so no event is reported
+			 * twice, and the commit path restores them.  (P1-b
+			 * does not restore here: dropping the suppression at
+			 * this exit would make the re-execution re-report the
+			 * same hit forever without ever committing.)
 			 */
 			lse_emu_force_sig(SIGTRAP, TRAP_HWBKPT, iaddr, regs);
 			return 0;
@@ -1448,14 +1517,20 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 				esr |= ESR_ELx_WNR;
 			do_mem_abort(iaddr, esr, regs);
 
-			if (signal_pending(current))
-				return 0;	/* PC unchanged; retry by user */
+			if (signal_pending(current)) {
+				/* PC unchanged; retry by user (P1-b) */
+				lse_emu_wp_restore();
+				return 0;
+			}
 			continue;
 		}
 
 		/* LSE_EMU_RETRY: batch exhausted, nothing committed. */
-		if (signal_pending(current))
-			return 0;	/* PC unchanged; ret_to_user delivers */
+		if (signal_pending(current)) {
+			/* PC unchanged; ret_to_user delivers (P1-b) */
+			lse_emu_wp_restore();
+			return 0;
+		}
 		cond_resched();
 	}
 }

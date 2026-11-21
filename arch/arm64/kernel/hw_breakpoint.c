@@ -916,9 +916,14 @@ NOKPROBE_SYMBOL(reinstall_suspended_bps);
 /*
  * Watchpoint suppression for the LSE emulation debug bridge: the helper's
  * inner access matched an EL0 watchpoint, so the EL0 watchpoints are
- * disabled (with the existing wps_disabled bookkeeping) until the emulated
- * instruction has either committed (restore) or the re-executed instruction
- * commits (restore on the next successful emulation).
+ * disabled (with the existing wps_disabled bookkeeping).  Per ARM DDI
+ * 0487A D2.10.8 the matched instruction has not executed and the memory
+ * location is Unchanged, so the attempt aborts via the extable fixup and
+ * the watchpoints stay suppressed across the exactly-once re-execution;
+ * the emulation commit path restores them.  Every other emulation exit
+ * (page fault, batch exhaustion, illegal encoding, alignment, domain
+ * rejection) restores them immediately as well, so a SIGTRAP handler
+ * exit can never leave the EL0 watchpoints disabled for good (P1-b).
  */
 void lse_emu_wp_suppress(void)
 {

@@ -1006,6 +1006,7 @@ config ARM64_LSE_ATOMICS
 config ARM64_LSE_EMULATE
 	bool "Emulate userland LSE atomics and LDAPR on ARMv8.0 cores"
 	depends on !ARM64_LSE_ATOMICS
+	default y
 	help
 	  Emulates the ARMv8.1 LSE atomic instructions (LDADD/LDCLR/LDEOR/
 	  LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP/CAS/CASP) and the ARMv8.3
