@@ -30,6 +30,7 @@
 #include <linux/pagevec.h>
 #include <linux/migrate.h>
 #include <linux/sched/signal.h>
+#include <linux/mm_inline.h>	/* 4.14: lru_to_page lives here, not mm/internal.h */
 
 #include "internal.h"
 
@@ -117,7 +118,8 @@ iomap_page_create(struct inode *inode, struct page *page)
 	iop = kmalloc(sizeof(*iop), GFP_NOFS | __GFP_NOFAIL);
 	atomic_set(&iop->read_count, 0);
 	atomic_set(&iop->write_count, 0);
-	bitmap_zero(iop->uptodate, PAGE_SIZE / SECTOR_SIZE);
+	/* 4.14: no SECTOR_SIZE constant; SECTOR_SHIFT is defined above */
+	bitmap_zero(iop->uptodate, PAGE_SIZE >> SECTOR_SHIFT);
 
 	/*
 	 * migrate_page_move_mapping() assumes that pages with private data have
@@ -508,6 +510,37 @@ done:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(iomap_readpages);
+
+/*
+ * 4.14 adaptation: the graft dropped iomap_bmap() along with the rest of the
+ * 4.19-era block-mapping helper, but erofs still needs it for its ->bmap.
+ */
+static loff_t
+iomap_bmap_actor(struct inode *inode, loff_t pos, loff_t length,
+		void *data, struct iomap *iomap)
+{
+	sector_t *bno = data;
+
+	if (iomap->type == IOMAP_MAPPED)
+		*bno = (iomap->addr + (pos - iomap->offset)) >> 9;
+	return 0;
+}
+
+sector_t
+iomap_bmap(struct address_space *mapping, sector_t bno,
+		const struct iomap_ops *ops)
+{
+	struct inode *inode = mapping->host;
+	loff_t pos = (loff_t)bno << inode->i_blkbits;
+	sector_t dbno = 0;
+
+	if (!ops->iomap_begin)
+		return 0;
+
+	iomap_apply(inode, pos, 1, 0, ops, &dbno, iomap_bmap_actor);
+	return dbno;
+}
+EXPORT_SYMBOL_GPL(iomap_bmap);
 
 /*
  * iomap_is_partially_uptodate checks whether blocks within a page are

@@ -39,7 +39,16 @@ struct vm_fault;
 #define IOMAP_INLINE		0x05	/* data inline in the inode */
 
 struct iomap {
-	sector_t		addr;	/* 1st sector of mapping, 512b units */
+	/*
+	 * 4.14 adaptation: the 4.14-era field spelling is blkno, the grafted
+	 * 5.x readpath spells it addr.  Same storage, same semantics (1st
+	 * sector of the mapping, 512b units), so both spellings alias one
+	 * member and no in-tree consumer needs to change.
+	 */
+	union {
+		sector_t	addr;	/* 1st sector of mapping, 512b units */
+		sector_t	blkno;	/* 4.14 spelling of addr */
+	};
 	loff_t			offset;	/* file offset of mapping, bytes */
 	u64			length;	/* length of mapping, bytes */
 	u16			type;	/* type of mapping */
@@ -47,6 +56,11 @@ struct iomap {
 	struct block_device	*bdev;	/* block device for I/O */
 	struct dax_device	*dax_dev; /* dax_dev for dax operations */
 	void			*inline_data;	/* data, if IOMAP_INLINE */
+	/*
+	 * 4.14 adaptation: erofs keeps its metabuf base pointer across
+	 * iomap_begin/iomap_end through the mapping.
+	 */
+	void			*private;	/* fs-private (erofs metabuf) */
 };
 
 /*
@@ -109,6 +123,15 @@ int iomap_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 loff_t iomap_seek_hole(struct inode *inode, loff_t offset,
 		const struct iomap_ops *ops);
 loff_t iomap_seek_data(struct inode *inode, loff_t offset,
+		const struct iomap_ops *ops);
+
+/*
+ * Buffered readpath (grafted from the 4.19/5.x-era iomap.c, needed by erofs).
+ */
+int iomap_readpage(struct page *page, const struct iomap_ops *ops);
+int iomap_readpages(struct address_space *mapping, struct list_head *pages,
+		unsigned nr_pages, const struct iomap_ops *ops);
+sector_t iomap_bmap(struct address_space *mapping, sector_t bno,
 		const struct iomap_ops *ops);
 
 /*
