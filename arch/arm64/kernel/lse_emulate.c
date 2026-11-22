@@ -1236,8 +1236,12 @@ static bool lse_emu_el0_wp_covers(unsigned long addr)
 		if (!wp)
 			continue;
 		info = counter_arch_bp(wp);
+		/* Same enable filter as lse_emu_wp_precheck() below: the
+		 * ctrl.enabled snapshot is stale-zero on the 4.14 ptrace
+		 * path; attr.disabled is the live flag. */
 		if (info->ctrl.privilege != AARCH64_BREAKPOINT_EL0 ||
-		    !info->ctrl.enabled)
+		    wp->attr.disabled ||
+		    current->thread.debug.wps_disabled)
 			continue;
 		low  = info->address + __ffs(info->ctrl.len);
 		high = info->address + __fls(info->ctrl.len);
@@ -1260,10 +1264,16 @@ static bool lse_emu_el0_wp_covers(unsigned long addr)
  * in software against the current task's installed watchpoints, with the
  * same semantics watchpoint_handler() applies to a hardware hit
  * (hw_breakpoint.c):
- *  - task ownership: the slots are current->thread.debug.hbp_watch[],
- *    installed through the ptrace (PTRACE_SETREGSET NT_HW_*WATCH) and
- *    perf_event_open HW_BREAKPOINT interfaces; a task without
- *    breakpoints can never match;
+	 *  - task ownership: the slots are current->thread.debug.hbp_watch[],
+	 *    installed through the ptrace (PTRACE_SETREGSET NT_HW_*WATCH)
+	 *    interface only; a task without breakpoints can never match.
+	 *    Known limitation: perf_event_open() user watchpoints are
+	 *    registered in the per-CPU wp_on_reg[] slots and never enter
+	 *    hbp_watch[], so this pre-check cannot see them -- the ptrace
+	 *    (debugger) path is fully covered, the perf path remains a
+	 *    blind spot for emulated accesses (those watchpoints are still
+	 *    honoured for all non-emulated accesses by the hardware and the
+	 *    WATCHPT_CUR bridge);
  *  - byte range: low = WVR + ffs(WCR.len), high = WVR + fls(WCR.len) --
  *    the same interval get_distance_from_watchpoint() derives, so the
  *    overlap test reproduces its exact-match condition;
@@ -1295,8 +1305,13 @@ static bool lse_emu_el0_wp_covers(unsigned long addr)
 static bool lse_emu_wp_precheck(unsigned long addr, unsigned long bytes,
 				bool write, unsigned long *hit_addr)
 {
-	u64 lo = addr, hi = addr + bytes - 1;
+	u64 lo, hi;
 	int i;
+
+	/* Parity with get_distance_from_watchpoint(): strip TBI tags. */
+	addr = untagged_addr(addr);
+	lo = addr;
+	hi = addr + bytes - 1;
 
 	for (i = 0; i < ARM_MAX_WRP; i++) {
 		struct perf_event *wp = current->thread.debug.hbp_watch[i];
@@ -1306,8 +1321,30 @@ static bool lse_emu_wp_precheck(unsigned long addr, unsigned long bytes,
 		if (!wp)
 			continue;
 		info = counter_arch_bp(wp);
+		/*
+		 * Enable test: wp->attr.disabled is the only live, reliable
+		 * enable flag in the hbp_watch[] slots (sole writers:
+		 * modify_user_hw_breakpoint(), events/hw_breakpoint.c:447
+		 * and :456).  info->ctrl.enabled is a build-time snapshot
+		 * written by arch_build_bp_info() (hw_breakpoint.c:512,
+		 * ctrl.enabled = !bp->attr.disabled) when the event is
+		 * created/validated: the 4.14 ptrace flow creates the event
+		 * with attr.disabled = 1 (ptrace_hbp_create(), ptrace.c:324)
+		 * and modify_user_hw_breakpoint() re-sets bp->attr.disabled
+		 * = 1 before the validate/rebuild and only calls
+		 * perf_event_enable() + clears the flag afterwards
+		 * (:447/:455-456) -- the ctrl snapshot is never rebuilt with
+		 * the enabled attr, so ctrl.enabled stays 0 for every
+		 * ptrace-installed watchpoint and testing it here would skip
+		 * them all.  wps_disabled excludes the single-step
+		 * suspension window (watchpoint handlers park the hardware
+		 * watchpoints with debug_info->wps_disabled = 1 while
+		 * stepping), during which a software hit would be a false
+		 * positive.
+		 */
 		if (info->ctrl.privilege != AARCH64_BREAKPOINT_EL0 ||
-		    !info->ctrl.enabled)
+		    wp->attr.disabled ||
+		    current->thread.debug.wps_disabled)
 			continue;
 
 		/* Direction: LDAPR is load-only; RMW/CAS/CASP do both. */
