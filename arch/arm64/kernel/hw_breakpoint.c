@@ -770,6 +770,22 @@ static int watchpoint_handler(unsigned long addr, unsigned int esr,
 	struct debug_info *debug_info;
 	struct arch_hw_breakpoint_ctrl ctrl;
 
+	/*
+	 * Note on the LSE/LDAPR trap emulation (CONFIG_ARM64_LSE_EMULATE,
+	 * arch/arm64/kernel/lse_emulate.c): its LL/SC helper bodies run at
+	 * EL1, so their inner user-memory accesses are EL1-privilege and
+	 * cannot match EL0-privilege watchpoints (DBGWCR.PAC state match)
+	 * -- WATCHPT_CUR will not fire for them.  User watchpoints on
+	 * emulated accesses are therefore honoured by a software pre-check
+	 * in lse_emulate.c (lse_emu_wp_precheck) that mirrors the matching
+	 * semantics below -- byte range from WVR + ffs/fls(WCR.len),
+	 * direction from the LOAD/STORE ctrl.type bits, task ownership via
+	 * current->thread.debug.hbp_watch[] -- before the exclusive window
+	 * opens, and cancels the attempt (SIGTRAP/TRAP_HWBKPT, PC
+	 * untouched).  This handler stays the reporting path for debug
+	 * events that do fire inside the emulation window (defence in
+	 * depth) and for all non-emulated accesses.
+	 */
 	slots = this_cpu_ptr(wp_on_reg);
 	debug_info = &current->thread.debug;
 

@@ -32,9 +32,14 @@
  *    original EL0 data abort: EC=DABT_LOW, IL=1, ISV=0 with the inner FSC
  *    plus EA/FnV preserved (si_addr invalid when FnV=1, matching do_sea()
  *    in this tree) and the logical WnR of the emulated access;
- *  - EL0 hardware watchpoints hit by the inner accesses cancel the attempt
- *    and are reported once per hit as SIGTRAP/TRAP_HWBKPT with the user PC
- *    untouched: per ARM DDI 0487A D2.10.8 the matched instruction has not
+ *  - EL0 hardware watchpoints are honoured on emulated accesses: because
+ *    the inner accesses run at EL1 they cannot match EL0-only watchpoints
+ *    in hardware, so a software pre-check matches the access interval
+ *    against the task's watchpoints before the window opens and cancels
+ *    the attempt; a WATCHPT_CUR hit inside the window is handled the same
+ *    way (cancel = trap).  Either path reports SIGTRAP/TRAP_HWBKPT with
+ *    the user PC untouched: per ARM DDI 0487A D2.10.8 the matched
+ *    instruction has not
  *    executed and the memory location is Unchanged, so the instruction is
  *    simply re-executed, and every re-execution that hits the watchpoint
  *    again reports again -- exactly the behaviour of a native LL/SC
@@ -947,10 +952,18 @@ NOKPROBE_SYMBOL(lse_emu_cas_64_body);
  * STXP whose success validates the whole 128-bit reservation before the
  * old pair is reported (design §3.4: the validation may not be skipped).
  *
- * x1 addr, w2 af, w3 rf, w4 al, x5 exp0 (then mismatch flag t1),
- * x6 exp1 (then mismatch flag t2), x7 des0, x8 des1, x9 old0, x10 old1,
- * x11 val0, x12 val1, w13 st, w14 status, w15 cnt.  exp0/exp1 are dead
- * after their compares, so they double as the mismatch flags.
+ * x1 addr, w2 af, w3 rf, w4 al, x5 exp0, x6 exp1, x7 des0, x8 des1,
+ * x9 old0, x10 old1, x11 val0, x12 val1, w13 st, w14 status, w15 cnt.
+ *
+ * Round-3 P0-1: x5/x6 keep the expected pair for the whole body.  The
+ * compare is a cmp/ccmp pair whose result drives the CSELs, so no compare
+ * ever overwrites x5/x6 and every retry of the bounded batch re-compares
+ * against the original expected values.  (A previous revision clobbered
+ * x5/x6 with the per-half mismatch flags; after a failed STXP the retry
+ * compared the reloaded pair against those stale 0/1 flags instead of the
+ * expected pair -- a same-value M could be reported as a false success
+ * when the stale flags happened to match, and a genuinely matching pair
+ * could be reported as a false failure.)
  */
 asm(".pushsection .text.lse_emu, \"ax\"\n"
 	".align	2\n"
@@ -972,11 +985,7 @@ asm(".pushsection .text.lse_emu, \"ax\"\n"
 	"2:\n"
 	"62:	ldxp	x9, x10, [x1]\n"
 	"4:	cmp	x9, x5\n"
-	"	cset	x5, ne\n"
-	"	cmp	x10, x6\n"
-	"	cset	x6, ne\n"
-	"	orr	x5, x5, x6\n"
-	"	cmp	x5, xzr\n"
+	"	ccmp	x10, x6, #0, eq\n"
 	"	csel	x11, x7, x9, eq\n"
 	"	csel	x12, x8, x10, eq\n"
 	"6:	cbz	w3, 8f\n"
@@ -1237,6 +1246,94 @@ static bool lse_emu_el0_wp_covers(unsigned long addr)
 	}
 	return false;
 }
+
+/*
+ * Round-3 P0-2: software watchpoint pre-check.
+ *
+ * The helper bodies run at EL1, so their inner LDXR/LDAXR/LDXP/LDAR and
+ * STLXR/STLXP/STXR accesses are EL1-privilege loads/stores and, per Arm
+ * DDI 0487A D2.9.5/D2.10 (DBGWCR.PAC and the StateMatch rules), they do
+ * NOT match EL0-only watchpoints (PAC = 0b10).  Waiting for a
+ * WATCHPT_CUR debug exception would therefore silently drop every user
+ * watchpoint hit on an emulated access.  Instead, before the exclusive
+ * window opens, the full access interval [addr, addr + bytes) is matched
+ * in software against the current task's installed watchpoints, with the
+ * same semantics watchpoint_handler() applies to a hardware hit
+ * (hw_breakpoint.c):
+ *  - task ownership: the slots are current->thread.debug.hbp_watch[],
+ *    installed through the ptrace (PTRACE_SETREGSET NT_HW_*WATCH) and
+ *    perf_event_open HW_BREAKPOINT interfaces; a task without
+ *    breakpoints can never match;
+ *  - byte range: low = WVR + ffs(WCR.len), high = WVR + fls(WCR.len) --
+ *    the same interval get_distance_from_watchpoint() derives, so the
+ *    overlap test reproduces its exact-match condition;
+ *  - direction: ctrl.type LOAD/STORE bits, mirroring watchpoint_handler()'s
+ *    access-type check.  A load-only LDAPR matches load watchpoints only;
+ *    RMW/CAS/CASP perform both a load and a store half, so a watchpoint
+ *    of either direction matches (a native LDXR/STXR pair would raise
+ *    both events; cancel = trap reports the first one only).
+ *
+ * On a hit the attempt is cancelled before any user memory is touched
+ * (the same cancel = trap semantics as the WATCHPT_CUR bridge below):
+ * CLREX abandons any stale exclusive monitor, status = FAULT with
+ * ev = LSE_EMU_EV_DEBUG makes the handler report SIGTRAP/TRAP_HWBKPT
+ * with the data address and the user PC untouched, so the instruction is
+ * re-executed on return.  This is also the ptrace contract: the debugger
+ * sees one report per re-execution that still hits, exactly as for a
+ * native LL/SC sequence under a watchpoint; the watchpoint itself is
+ * never suppressed or modified.  The pre-check runs with IRQs and
+ * preemption already off (inside the attempt-window open sequence), so
+ * the per-task breakpoint slots cannot be registered, unregistered or
+ * modified concurrently (ptrace and perf installs target either a
+ * stopped task or self with IRQs enabled).  The existing WATCHPT_CUR
+ * bridge is kept as defence in depth for events that do fire while the
+ * window is open.
+ *
+ * si_addr is the access base -- the same FAR the inner access itself
+ * would produce, matching what the hardware bridge reports.
+ */
+static bool lse_emu_wp_precheck(unsigned long addr, unsigned long bytes,
+				bool write, unsigned long *hit_addr)
+{
+	u64 lo = addr, hi = addr + bytes - 1;
+	int i;
+
+	for (i = 0; i < ARM_MAX_WRP; i++) {
+		struct perf_event *wp = current->thread.debug.hbp_watch[i];
+		struct arch_hw_breakpoint *info;
+		u64 wlow, whigh;
+
+		if (!wp)
+			continue;
+		info = counter_arch_bp(wp);
+		if (info->ctrl.privilege != AARCH64_BREAKPOINT_EL0 ||
+		    !info->ctrl.enabled)
+			continue;
+
+		/* Direction: LDAPR is load-only; RMW/CAS/CASP do both. */
+		if (write) {
+			if (!(info->ctrl.type &
+			      (ARM_BREAKPOINT_LOAD | ARM_BREAKPOINT_STORE)))
+				continue;
+		} else if (!(info->ctrl.type & ARM_BREAKPOINT_LOAD)) {
+			continue;
+		}
+
+		wlow  = info->address + __ffs(info->ctrl.len);
+		whigh = info->address + __fls(info->ctrl.len);
+		if (lo <= whigh && wlow <= hi) {
+			*hit_addr = addr;
+			return true;
+		}
+	}
+	return false;
+}
+#else	/* !CONFIG_HAVE_HW_BREAKPOINT: no watchpoints can exist */
+static bool lse_emu_wp_precheck(unsigned long addr, unsigned long bytes,
+				bool write, unsigned long *hit_addr)
+{
+	return false;
+}
 #endif
 
 /*
@@ -1341,15 +1438,41 @@ static void lse_emu_force_sig(int sig, int code, unsigned long addr,
 /* Validation before any window is opened (design §4.1)               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * VMA validation before any window is opened (design §4.1).  *grow is set
+ * to true for the one gap shape do_page_fault() itself would try to grow
+ * into (round-3 P1-a): the caller must then release mmap_sem and route the
+ * access through the standard EL0 data-abort path instead of rejecting it.
+ */
 static bool lse_emu_check_vma(struct mm_struct *mm, unsigned long addr,
 			      unsigned long len, bool write, int *sig,
-			      int *code)
+			      int *code, bool *grow)
 {
 	struct vm_area_struct *vma;
 
 	vma = find_vma(mm, addr);
-	/* find_vma() may return a vma that starts behind addr: check gap. */
-	if (!vma || vma->vm_start > addr || addr + len > vma->vm_end) {
+	/*
+	 * find_vma() may return a vma that starts behind addr: the address
+	 * sits in a gap below the lowest mapping.  Round-3 P1-a: this is
+	 * exactly the case do_page_fault()'s check_stack path handles with
+	 * expand_stack() when the vma found above the gap is VM_GROWSDOWN
+	 * (fault.c __do_page_fault: vma->vm_start > addr ->
+	 * VM_GROWSDOWN && !expand_stack(vma, addr) -> good_area), so it
+	 * must not be rejected here as MAPERR; *grow tells the caller to
+	 * walk the standard fault path instead (it may not run while this
+	 * code holds mmap_sem for read).
+	 */
+	if (!vma || vma->vm_start > addr) {
+		if (vma && (vma->vm_flags & VM_GROWSDOWN)) {
+			*grow = true;
+			return false;
+		}
+		*sig = SIGSEGV;
+		*code = SEGV_MAPERR;
+		return false;
+	}
+	/* A straddling access crosses out of the vma: plain MAPERR. */
+	if (addr + len > vma->vm_end) {
 		*sig = SIGSEGV;
 		*code = SEGV_MAPERR;
 		return false;
@@ -1357,12 +1480,16 @@ static bool lse_emu_check_vma(struct mm_struct *mm, unsigned long addr,
 
 	/*
 	 * Read side (LDAPR, or the load half of RMW/CAS/CASP): allow
-	 * VM_READ or VM_EXEC.  That is the same set this tree's
-	 * do_page_fault() admits for an EL0 data read fault
-	 * (vm_flags = VM_READ | VM_WRITE | VM_EXEC is its default for a
-	 * read abort): an exec-only user mapping gets a user-readable PTE
-	 * here, and a native LDAR/LDAXR on such a page would read it
-	 * fine, so the emulated load must be allowed to do the same.
+	 * VM_READ, VM_WRITE or VM_EXEC -- the exact set this tree's
+	 * do_page_fault() admits for an EL0 data read fault (fault.c
+	 * do_page_fault: vm_flags = VM_READ | VM_WRITE | VM_EXEC is the
+	 * default for a read abort; only WnR=1 non-CM narrows it to
+	 * VM_WRITE).  Round-3 P0-3: a PROT_WRITE-only user mapping gets a
+	 * user-readable PTE here (arm64 protection_map: VM_WRITE alone is
+	 * __P010 = PAGE_READONLY, which carries PTE_USER), and a native
+	 * LDAR/LDAXR on such a page would read it fine, so the emulated
+	 * load must be allowed to do the same; rejecting it here used to
+	 * break legitimate write-only LDAPR traffic.
 	 * Write side: require VM_WRITE, matching the WnR=1 fault the
 	 * inner exclusive store would take.  A compare failure or a ZR
 	 * source does not waive the permission requirements.
@@ -1373,7 +1500,7 @@ static bool lse_emu_check_vma(struct mm_struct *mm, unsigned long addr,
 			*code = SEGV_ACCERR;
 			return false;
 		}
-	} else if (!(vma->vm_flags & (VM_READ | VM_EXEC))) {
+	} else if (!(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))) {
 		*sig = SIGSEGV;
 		*code = SEGV_ACCERR;
 		return false;
@@ -1407,7 +1534,7 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 	unsigned int ev, iesr;
 	unsigned long iaddr;
 	int sig = 0, code = 0;
-	bool write;
+	bool write, grow;
 
 	if (!user_mode(regs))
 		return 1;
@@ -1487,9 +1614,49 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		int result;
 
 		/* VMA view taken outside the exclusive window (design §4.1). */
+		grow = false;
 		down_read(&mm->mmap_sem);
-		if (!lse_emu_check_vma(mm, addr, d.bytes, write, &sig, &code)) {
+		if (!lse_emu_check_vma(mm, addr, d.bytes, write, &sig, &code,
+				       &grow)) {
 			up_read(&mm->mmap_sem);
+			if (grow) {
+				/*
+				 * Round-3 P1-a: the address sits in a gap
+				 * below the lowest mapping with the
+				 * VM_GROWSDOWN stack vma starting above it
+				 * -- do not reject it, let the standard EL0
+				 * data-abort path run expand_stack()
+				 * (do_page_fault -> __do_page_fault
+				 * check_stack).  mmap_sem was released above
+				 * because the fault path must take it
+				 * itself; the synthesized syndrome is what
+				 * a native LSE instruction on this address
+				 * would raise: EC=DABT_LOW, IL=1, ISV=0
+				 * (no ISS payload), FSC = translation fault
+				 * level 0 (fault_info[4] ->
+				 * do_translation_fault -> do_page_fault),
+				 * WnR per the logical access so a write
+				 * fault resolves COW during the grow.
+				 * Either the mapping appears and the loop
+				 * re-validates from the top, or the fault
+				 * path delivers SIGSEGV with the PC
+				 * untouched and we hand over to the signal
+				 * -- identical to a native faulting LSE.
+				 */
+				u32 fesr = ((u32)ESR_ELx_EC_DABT_LOW <<
+					    ESR_ELx_EC_SHIFT) |
+					   (u32)ESR_ELx_IL;
+
+				/* translation fault, level 0 (fault_info[4]) */
+				fesr |= 0x04;
+				if (write)
+					fesr |= ESR_ELx_WNR;
+				do_mem_abort(addr, fesr, regs);
+
+				if (signal_pending(current))
+					return 0;	/* PC unchanged */
+				continue;
+			}
 			lse_emu_force_sig(sig, code, addr, regs);
 			return 0;
 		}
@@ -1515,7 +1682,25 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		WRITE_ONCE(ctx->esr, 0);
 		WRITE_ONCE(ctx->addr, 0);
 
-		lse_emu_attempt(&q, &d);
+		/*
+		 * Round-3 P0-2: software watchpoint pre-check, run with
+		 * IRQs and preemption off so the per-task breakpoint
+		 * slots are stable while they are scanned.  On a hit the
+		 * attempt is cancelled before any user memory is touched
+		 * (see lse_emu_wp_precheck): the handler's FAULT + EV_DEBUG
+		 * path below reports SIGTRAP/TRAP_HWBKPT with the user PC
+		 * untouched.  The WATCHPT_CUR bridge remains as defence
+		 * in depth for events that fire inside the window.
+		 */
+		if (lse_emu_wp_precheck(addr, d.bytes, write, &iaddr)) {
+			asm volatile("clrex" ::: "memory");
+			WRITE_ONCE(ctx->addr, iaddr);
+			WRITE_ONCE(ctx->ev, LSE_EMU_EV_DEBUG);
+			result = LSE_EMU_FAULT;
+		} else {
+			lse_emu_attempt(&q, &d);
+			result = q.status;
+		}
 
 		/* Copy the bridge state out before leaving the window. */
 		ev = READ_ONCE(ctx->ev);
@@ -1526,8 +1711,6 @@ static int lse_emu_handler(struct pt_regs *regs, u32 insn)
 		/* Clear the scratch fields so no inner-event data can leak. */
 		WRITE_ONCE(ctx->esr, 0);
 		WRITE_ONCE(ctx->addr, 0);
-
-		result = q.status;
 
 		uaccess_disable();
 		pagefault_enable();
