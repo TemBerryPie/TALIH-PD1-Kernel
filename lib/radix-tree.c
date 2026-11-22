@@ -43,9 +43,11 @@
 static unsigned long height_to_maxnodes[RADIX_TREE_MAX_PATH + 1] __read_mostly;
 
 /*
- * Radix tree node cache.
+ * Radix tree node cache.  Non-static (4.20-era behaviour, cf. upstream
+ * "xarray: use the radix tree node cache"): the backported lib/xarray.c
+ * shares this node cache and links against it.
  */
-static struct kmem_cache *radix_tree_node_cachep;
+struct kmem_cache *radix_tree_node_cachep;
 
 /*
  * The radix tree is variable-height, so an insert operation not only has
