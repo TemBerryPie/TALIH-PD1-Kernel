@@ -84,7 +84,7 @@ static void read_cache_pages_invalidate_pages(struct address_space *mapping,
  * Hides the details of the LRU cache etc from the filesystems.
  */
 int read_cache_pages(struct address_space *mapping, struct list_head *pages,
-			int (*filler)(void *, struct page *), void *data)
+			filler_t *filler, void *data)
 {
 	struct page *page;
 	int ret = 0;
@@ -251,7 +251,7 @@ EXPORT_SYMBOL_GPL(page_cache_ra_unbounded);
  * page_cache_ra_unbounded() so that existing callers (filemap.c mmap
  * read-around via ra_submit, fadvise/madvise WILLNEED) keep working unchanged.
  */
-unsigned long __do_page_cache_readahead(struct address_space *mapping,
+int __do_page_cache_readahead(struct address_space *mapping,
 		struct file *filp, pgoff_t index, unsigned long nr_to_read,
 		unsigned long lookahead_size)
 {
@@ -663,7 +663,20 @@ ssize_t ksys_readahead(int fd, loff_t offset, size_t count)
 	    !S_ISREG(file_inode(f.file)->i_mode))
 		goto out;
 
-	ret = vfs_fadvise(f.file, offset, count, POSIX_FADV_WILLNEED);
+	/*
+	 * 4.14: no vfs_fadvise(); kick readahead directly, keeping the old
+	 * do_readahead() semantics (page-aligned window, DAX mappings skipped).
+	 */
+	{
+		struct address_space *mapping = f.file->f_mapping;
+		pgoff_t start = offset >> PAGE_SHIFT;
+		pgoff_t end = (offset + count - 1) >> PAGE_SHIFT;
+		unsigned long len = end - start + 1;
+
+		if (!dax_mapping(mapping))
+			force_page_cache_readahead(mapping, f.file, start, len);
+	}
+	ret = 0;
 out:
 	fdput(f);
 	return ret;
