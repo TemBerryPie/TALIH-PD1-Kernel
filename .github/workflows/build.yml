@@ -65,8 +65,13 @@ jobs:
           Acquire::https::Timeout "120";
           EOF
           sudo apt-get update
+          # cross gcc pulls a broken resolver chain on current ubuntu-latest images;
+          # kbuild with CC=clang only needs the aarch64 binutils (as/ld/objcopy)
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libssl-dev flex bison bc ccache
+            binutils-aarch64-linux-gnu libssl-dev flex bison bc
+          # ccache is optional speed-up; tolerate resolver drift
+          sudo apt-get install -y --no-install-recommends ccache \
+            || echo "ccache unavailable; building without cache"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -84,13 +89,18 @@ jobs:
           export PATH="/opt/clang/bin:$PATH"
           export CCACHE_DIR="$HOME/.ccache"
           export CCACHE_COMPILERCHECK=content
-          ccache --zero-stats
-          make ARCH=arm64 CC="ccache clang" \
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --zero-stats
+            CCWRAP="ccache"
+          else
+            CCWRAP=""
+          fi
+          make ARCH=arm64 CC="$CCWRAP clang" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KBUILD_BUILD_VERSION="${{ github.run_number }}" \
             -j"$(nproc)" -k Image dtbs
-          ccache --show-stats
+          if command -v ccache >/dev/null 2>&1; then ccache --show-stats; fi
           test -s arch/arm64/boot/Image
           test -s arch/arm64/boot/dts/mediatek/mt6771.dtb
 
