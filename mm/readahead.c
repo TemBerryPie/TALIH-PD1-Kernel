@@ -204,7 +204,7 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 	for (i = 0; i < nr_to_read; i++) {
 		struct page *page;
 		rcu_read_lock();
-		page = radix_tree_lookup(&mapping->i_pages, index + i);
+		page = radix_tree_lookup(&mapping->page_tree, index + i);
 		rcu_read_unlock();
 
 		if (page && !radix_tree_exceptional_entry(page)) {
@@ -707,7 +707,7 @@ void readahead_expand(struct readahead_control *ractl,
 		struct page *page;
 		unsigned long index = ractl->_index - 1;
 		rcu_read_lock();
-		page = radix_tree_lookup(&mapping->i_pages, index);
+		page = radix_tree_lookup(&mapping->page_tree, index);
 		rcu_read_unlock();
 
 		if (page && !radix_tree_exceptional_entry(page))
@@ -733,7 +733,7 @@ void readahead_expand(struct readahead_control *ractl,
 		struct page *page;
 		unsigned long index = ractl->_index + ractl->_nr_pages;
 		rcu_read_lock();
-		page = radix_tree_lookup(&mapping->i_pages, index);
+		page = radix_tree_lookup(&mapping->page_tree, index);
 		rcu_read_unlock();
 
 		if (page && !radix_tree_exceptional_entry(page))
