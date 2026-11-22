@@ -18,7 +18,9 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/iomap.h>
+#include <linux/xarray.h>
 #include "erofs_fs.h"
+#include "erofs_compat.h"
 
 #include <linux/kobject.h>
 
