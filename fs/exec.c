@@ -67,6 +67,12 @@
 #include <linux/reboot.h>
 #include <linux/sizes.h>
 #endif
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+#include <linux/talih_pass2_diag.h>
+#include <linux/task_work.h>
+#include <linux/uprobes.h>
+#include <asm/ptrace.h>
+#endif
 
 #include <linux/uaccess.h>
 #ifdef CONFIG_KSU_SUSFS
@@ -1729,6 +1735,106 @@ static int talih_pass2_read_init(struct linux_binprm *bprm, bool recovery)
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
 static bool talih_pass2_selinux_entered;
 
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+#define TALIH_PASS2_SECOND_OFFSET	0x14cc20UL
+#define TALIH_PASS2_SECOND_INSN		0xa9ba7bfdU
+#define TALIH_PASS2_POLICY_SIZE		1327526
+
+static bool talih_pass2_policy_loaded;
+static bool talih_pass2_second_attempted;
+static struct mm_struct *talih_pass2_second_mm;
+static unsigned long talih_pass2_second_pc;
+static struct callback_head talih_pass2_second_work;
+
+void talih_pass2_note_policy_load(size_t size)
+{
+	if (talih_pass2_selinux_entered)
+		talih_pass2_policy_loaded = size == TALIH_PASS2_POLICY_SIZE;
+}
+
+static void talih_pass2_second_stop(struct callback_head *work)
+{
+	pr_emerg("TALIH_PASS2_DIAG: SecondStageMain reached, before RC\n");
+	talih_pass2_stop(0);
+}
+
+static int talih_pass2_second_hit(struct uprobe_consumer *self,
+				  struct pt_regs *regs)
+{
+	if (current->mm != READ_ONCE(talih_pass2_second_mm))
+		return 0;
+	if (task_pid_nr(current) != 1 ||
+	    instruction_pointer(regs) != talih_pass2_second_pc)
+		panic("TALIH_PASS2_DIAG: unexpected SecondStageMain probe hit");
+
+	/* 离开 uprobe 锁后、返回用户态前执行重启。 */
+	if (task_work_add(current, &talih_pass2_second_work, true))
+		panic("TALIH_PASS2_DIAG: failed to queue SecondStageMain stop");
+	return 0;
+}
+
+static bool talih_pass2_second_filter(struct uprobe_consumer *self,
+				       enum uprobe_filter_ctx ctx,
+				       struct mm_struct *mm)
+{
+	return mm == READ_ONCE(talih_pass2_second_mm);
+}
+
+static struct uprobe_consumer talih_pass2_second_probe = {
+	.handler = talih_pass2_second_hit,
+	.filter = talih_pass2_second_filter,
+};
+
+static int talih_pass2_arm_second_stage(struct file *file)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	struct inode *inode;
+	unsigned long addr = 0;
+	__le32 insn;
+	int ret;
+
+	if (!mm || !file)
+		return -EINVAL;
+	inode = file_inode(file);
+
+	down_read(&mm->mmap_sem);
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		unsigned long delta;
+
+		if (!vma->vm_file || file_inode(vma->vm_file) != inode ||
+		    (vma->vm_flags & (VM_EXEC | VM_WRITE)) != VM_EXEC ||
+		    vma->vm_pgoff > (TALIH_PASS2_SECOND_OFFSET >> PAGE_SHIFT))
+			continue;
+		delta = TALIH_PASS2_SECOND_OFFSET - (vma->vm_pgoff << PAGE_SHIFT);
+		if (delta + sizeof(insn) <= vma->vm_end - vma->vm_start) {
+			addr = vma->vm_start + delta;
+			break;
+		}
+	}
+	up_read(&mm->mmap_sem);
+	if (!addr || access_process_vm(current, addr, &insn, sizeof(insn), 0) !=
+	    sizeof(insn) || le32_to_cpu(insn) != TALIH_PASS2_SECOND_INSN)
+		return -ENOEXEC;
+
+	talih_pass2_second_pc = addr;
+	init_task_work(&talih_pass2_second_work, talih_pass2_second_stop);
+	WRITE_ONCE(talih_pass2_second_mm, mm);
+	ret = uprobe_register(inode, TALIH_PASS2_SECOND_OFFSET,
+			      &talih_pass2_second_probe);
+	if (ret)
+		return ret;
+
+	/* 先回读新地址空间，不能把注册成功当成断点一定安装成功。 */
+	if (access_process_vm(current, addr, &insn, sizeof(insn), 0) !=
+	    sizeof(insn) || le32_to_cpu(insn) != UPROBE_SWBP_INSN)
+		return -EIO;
+	pr_info("TALIH_PASS2_DIAG: SecondStageMain probe armed at file +0x%lx\n",
+		TALIH_PASS2_SECOND_OFFSET);
+	return 0;
+}
+#endif
+
 static bool talih_pass2_match_args(struct linux_binprm *bprm,
 				  const char *args, size_t size)
 {
@@ -1760,20 +1866,29 @@ static bool talih_pass2_match_args(struct linux_binprm *bprm,
 	return true;
 }
 
-static void talih_pass2_check_selinux_stage(struct linux_binprm *bprm)
+static bool talih_pass2_check_selinux_stage(struct linux_binprm *bprm)
 {
 	static const char setup[] = "/system/bin/init\0selinux_setup";
 	static const char next[] = "/system/bin/init\0second_stage";
 
 	if (talih_pass2_selinux_entered) {
-		if (talih_pass2_match_args(bprm, next, sizeof(next)))
+		if (talih_pass2_match_args(bprm, next, sizeof(next))) {
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+			if (talih_pass2_policy_loaded &&
+			    !talih_pass2_second_attempted) {
+				talih_pass2_second_attempted = true;
+				return true;
+			}
+#endif
 			pr_emerg("TALIH_PASS2_DIAG: second_stage blocked before exec\n");
-		else
+		} else {
 			pr_emerg("TALIH_PASS2_DIAG: unexpected PID 1 exec blocked\n");
+		}
 		talih_pass2_stop(-ECANCELED);
 	}
 	if (!talih_pass2_match_args(bprm, setup, sizeof(setup)))
 		talih_pass2_stop(-EINVAL);
+	return false;
 }
 
 static unsigned int talih_pass2_recovery_stage;
@@ -1819,6 +1934,9 @@ static int exec_binprm(struct linux_binprm *bprm)
 #ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
 	bool stop_before_userspace = task_pid_nr(current) == 1 && current->mm;
 	bool recovery = false;
+#ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
+	bool second_stage = false;
+#endif
 
 	if (stop_before_userspace) {
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
@@ -1826,7 +1944,7 @@ static int exec_binprm(struct linux_binprm *bprm)
 		if (recovery)
 			talih_pass2_check_recovery_stage(bprm);
 		else
-			talih_pass2_check_selinux_stage(bprm);
+			second_stage = talih_pass2_check_selinux_stage(bprm);
 #endif
 		ret = talih_pass2_read_init(bprm, recovery);
 		if (ret)
@@ -1851,6 +1969,16 @@ static int exec_binprm(struct linux_binprm *bprm)
 			pr_info("TALIH_PASS2_DIAG: entering recovery %s\n",
 				talih_pass2_recovery_stage == 1 ? "selinux_setup" :
 				"second_stage");
+		} else if (second_stage) {
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+			ret = talih_pass2_arm_second_stage(bprm->file);
+			if (ret) {
+				pr_emerg("TALIH_PASS2_DIAG: SecondStageMain probe not armed\n");
+				talih_pass2_stop(ret);
+			}
+#else
+			talih_pass2_stop(-EOPNOTSUPP);
+#endif
 		} else {
 			talih_pass2_selinux_entered = true;
 			pr_info("TALIH_PASS2_DIAG: entering selinux_setup\n");

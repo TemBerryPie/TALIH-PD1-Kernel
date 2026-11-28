@@ -31,6 +31,7 @@
 #include <linux/uaccess.h>
 #include <linux/kobject.h>
 #include <linux/ctype.h>
+#include <linux/talih_pass2_diag.h>
 
 /* selinuxfs pseudo filesystem for exporting the security policy API.
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
@@ -583,9 +584,11 @@ out:
 	mutex_unlock(&fsi->mutex);
 	vfree(data);
 	if (IS_ENABLED(CONFIG_TALIH_PASS2_SELINUX_DIAG) && length > 0 &&
-	    task_pid_nr(current) == 1)
+	    task_pid_nr(current) == 1) {
+		talih_pass2_note_policy_load(length);
 		pr_info("TALIH_PASS2_DIAG: PID 1 SELinux policy loaded, bytes=%zd\n",
 			length);
+	}
 	return length;
 }
 

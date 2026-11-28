@@ -1337,9 +1337,19 @@ config TALIH_PASS2_SELINUX_DIAG
 	bool "TALIH-PD1 Pass 2 SELinux 加载诊断"
 	depends on TALIH_PASS2_BOOT_DIAG && SECURITY_SELINUX && MTK_BOOT=y
 	help
-	  正常启动只放行供体 init 的 selinux_setup，在 second_stage 前停止。
+	  正常启动只放行供体 init 的 selinux_setup，默认在 second_stage 前停止。
 	  恢复模式只放行原厂 ramdisk init 的两次交棒，用于验证 fastbootd。
 	  两种模式均保留只读 UFS 防护。
+
+config TALIH_PASS2_SECOND_STAGE_DIAG
+	bool "TALIH-PD1 Pass 2 第二阶段入口诊断"
+	depends on TALIH_PASS2_SELINUX_DIAG && UPROBES && !CPU_BIG_ENDIAN
+	help
+	  仅在正常 PID 1 已成功加载预期策略时放行一次 second_stage。
+	  在供体 init 的 SecondStageMain 第一条指令前截停；断点安装
+	  或读回验证失败时提前停止。不改变恢复模式或存储写保护。
+	  断点只写入新进程的私有内存页，不修改 EROFS 镜像。
+	  此选项仅用于取证，不运行 RC 动作。
 
 config TALIH_PASS2_UDOT_DIAG
 	bool "TALIH-PD1 Pass 2 向量 UDOT 兼容诊断"
