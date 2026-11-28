@@ -1739,10 +1739,18 @@ static bool talih_pass2_selinux_entered;
 #define TALIH_PASS2_POLICY_SIZE		1327526
 
 /* 文件偏移与 VA 一致；这些布局由供体 init 的长度和 CRC 约束。 */
-#define TALIH_PASS2_CGROUP_ACTION	0x152950UL
 #define TALIH_PASS2_CGROUP_VTABLE	0x3590c0UL
 #define TALIH_PASS2_CGROUP_THUNK		0x111b20UL
 #define TALIH_PASS2_ACTION_CALL_RET	0xe87a8UL
+
+static const struct {
+	unsigned long offset;
+	const char *name;
+} talih_pass2_builtins[] = {
+	{ 0x152950UL, "SetupCgroupsAction" },
+	{ 0x185390UL, "SetKptrRestrict" },
+	{ 0x185e50UL, "TestPerfEventSelinux" },
+};
 
 struct talih_pass2_probe {
 	unsigned long offset;
@@ -1755,9 +1763,11 @@ static bool talih_pass2_policy_loaded;
 static bool talih_pass2_second_attempted;
 static struct mm_struct *talih_pass2_second_mm;
 static unsigned long talih_pass2_init_bias;
-static bool talih_pass2_cgroup_admitted;
+static unsigned int talih_pass2_next_builtin;
+static bool talih_pass2_builtin_active;
 static unsigned long talih_pass2_action;
 static unsigned long talih_pass2_command;
+static unsigned long talih_pass2_result;
 static struct callback_head talih_pass2_check_work;
 static struct callback_head talih_pass2_return_work;
 
@@ -1780,6 +1790,7 @@ static void talih_pass2_check_action(struct callback_head *work)
 	unsigned long action = untagged_addr(talih_pass2_action);
 	unsigned long cmd = untagged_addr(talih_pass2_command);
 	unsigned long bias = talih_pass2_init_bias;
+	unsigned int step = talih_pass2_next_builtin;
 	const char *reason;
 
 	/* 供体堆指针带 TBI 标签；GUP 和范围检查使用去标签地址。 */
@@ -1800,22 +1811,24 @@ static void talih_pass2_check_action(struct callback_head *work)
 	reason = "builtin identity";
 	if (!talih_pass2_read_user(command[0], functor, sizeof(functor)) ||
 	    functor[0] != bias + TALIH_PASS2_CGROUP_VTABLE ||
-	    functor[1] != bias + TALIH_PASS2_CGROUP_ACTION ||
+	    functor[1] != bias + talih_pass2_builtins[step].offset ||
 	    !talih_pass2_read_user(functor[0] + 0x30, &invoke, sizeof(invoke)) ||
 	    invoke != bias + TALIH_PASS2_CGROUP_THUNK)
 		goto reject;
 
-	talih_pass2_cgroup_admitted = true;
-	pr_info("TALIH_PASS2_DIAG: only SetupCgroupsAction admitted; tags action=%d args=%d\n",
+	talih_pass2_builtin_active = true;
+	pr_info("TALIH_PASS2_DIAG: builtin %s admitted; tags action=%d args=%d\n",
+		talih_pass2_builtins[step].name,
 		action != talih_pass2_action, begin != command[3]);
 	return;
 
 reject:
-	pr_emerg("TALIH_PASS2_DIAG: first init action rejected: %s\n", reason);
+	pr_emerg("TALIH_PASS2_DIAG: builtin %s rejected: %s\n",
+		 talih_pass2_builtins[step].name, reason);
 	talih_pass2_stop(-ECANCELED);
 }
 
-static void talih_pass2_cgroup_return(struct callback_head *work)
+static void talih_pass2_report_mounts(void)
 {
 	static const char * const paths[] = {
 		"/dev/blkio", "/dev/cpuctl", "/dev/cpuset", "/dev/memcg",
@@ -1824,9 +1837,9 @@ static void talih_pass2_cgroup_return(struct callback_head *work)
 	};
 	unsigned int i;
 
-	pr_emerg("TALIH_PASS2_DIAG: SetupCgroupsAction returned\n");
 	for (i = 0; i < ARRAY_SIZE(paths); i++) {
 		struct path path;
+		struct super_block *sb;
 		int err = kern_path(paths[i], LOOKUP_FOLLOW, &path);
 
 		if (err) {
@@ -1834,12 +1847,40 @@ static void talih_pass2_cgroup_return(struct callback_head *work)
 				paths[i], err);
 			continue;
 		}
-		pr_info("TALIH_PASS2_DIAG: path %s fstype=%s ro=%d\n",
-			paths[i], path.dentry->d_sb->s_type->name,
-			__mnt_is_readonly(path.mnt));
+		sb = path.dentry->d_sb;
+		pr_info("TALIH_PASS2_DIAG: path %s fstype=%s ro=%d sb=%s\n",
+			paths[i], sb->s_type->name, __mnt_is_readonly(path.mnt),
+			sb->s_id);
 		path_put(&path);
 	}
-	talih_pass2_stop(0);
+}
+
+static void talih_pass2_builtin_return(struct callback_head *work)
+{
+	unsigned long result = untagged_addr(talih_pass2_result);
+	unsigned int step = talih_pass2_next_builtin;
+	u32 tag;
+
+	/* 公共返回点的原指令会覆盖 x19；取断点保存的 Result 地址。 */
+	if (!result || result > TASK_SIZE - 0x24 ||
+	    !talih_pass2_read_user(result + 0x20, &tag, sizeof(tag))) {
+		pr_emerg("TALIH_PASS2_DIAG: builtin %s result unreadable\n",
+			 talih_pass2_builtins[step].name);
+		talih_pass2_stop(-EFAULT);
+	}
+	pr_info("TALIH_PASS2_DIAG: builtin %s returned, result=%u\n",
+		talih_pass2_builtins[step].name, tag);
+	if (tag) {
+		talih_pass2_report_mounts();
+		talih_pass2_stop(-ECANCELED);
+	}
+
+	talih_pass2_builtin_active = false;
+	if (++talih_pass2_next_builtin == ARRAY_SIZE(talih_pass2_builtins)) {
+		pr_emerg("TALIH_PASS2_DIAG: startup builtins returned, before early-init\n");
+		talih_pass2_report_mounts();
+		talih_pass2_stop(0);
+	}
 }
 
 static int talih_pass2_action_hit(struct uprobe_consumer *self,
@@ -1852,25 +1893,28 @@ static int talih_pass2_action_hit(struct uprobe_consumer *self,
 		return 0;
 	probe = container_of(self, struct talih_pass2_probe, consumer);
 	if (task_pid_nr(current) != 1 || instruction_pointer(regs) != probe->pc)
-		panic("TALIH_PASS2_DIAG: unexpected cgroup probe hit");
+		panic("TALIH_PASS2_DIAG: unexpected builtin probe hit");
+	if (talih_pass2_next_builtin >= ARRAY_SIZE(talih_pass2_builtins))
+		panic("TALIH_PASS2_DIAG: init action after builtin boundary");
 
 	if (probe->offset == 0xe8870UL) {
-		if (talih_pass2_cgroup_admitted)
-			panic("TALIH_PASS2_DIAG: second init action blocked");
+		if (talih_pass2_builtin_active)
+			panic("TALIH_PASS2_DIAG: nested init action blocked");
 		if (regs->regs[30] != talih_pass2_init_bias + TALIH_PASS2_ACTION_CALL_RET)
 			panic("TALIH_PASS2_DIAG: unexpected init action caller");
 		talih_pass2_action = regs->regs[0];
 		talih_pass2_command = regs->regs[1];
 		work = &talih_pass2_check_work;
 	} else {
-		if (!talih_pass2_cgroup_admitted || regs->regs[30] != probe->pc)
+		if (!talih_pass2_builtin_active || regs->regs[30] != probe->pc)
 			panic("TALIH_PASS2_DIAG: unverified builtin return blocked");
+		talih_pass2_result = regs->regs[19];
 		work = &talih_pass2_return_work;
 	}
 
 	/* 在持锁回调之外、返回用户态之前检查命令或重启。 */
 	if (task_work_add(current, work, true))
-		panic("TALIH_PASS2_DIAG: failed to queue cgroup probe work");
+		panic("TALIH_PASS2_DIAG: failed to queue builtin probe work");
 	return 0;
 }
 
@@ -1948,7 +1992,7 @@ static int talih_pass2_arm_second_stage(struct file *file)
 		return -EINVAL;
 	inode = file_inode(file);
 	init_task_work(&talih_pass2_check_work, talih_pass2_check_action);
-	init_task_work(&talih_pass2_return_work, talih_pass2_cgroup_return);
+	init_task_work(&talih_pass2_return_work, talih_pass2_builtin_return);
 	WRITE_ONCE(talih_pass2_second_mm, mm);
 	for (i = 0; i < ARRAY_SIZE(talih_pass2_action_probes); i++) {
 		struct talih_pass2_probe *probe = &talih_pass2_action_probes[i];
@@ -1962,7 +2006,7 @@ static int talih_pass2_arm_second_stage(struct file *file)
 			return -ENOEXEC;
 		talih_pass2_init_bias = bias;
 	}
-	pr_info("TALIH_PASS2_DIAG: cgroup action gate and return probe armed\n");
+	pr_info("TALIH_PASS2_DIAG: startup builtin gate and return probe armed\n");
 	return 0;
 }
 #endif

@@ -1342,14 +1342,14 @@ config TALIH_PASS2_SELINUX_DIAG
 	  两种模式均保留只读 UFS 防护。
 
 config TALIH_PASS2_SECOND_STAGE_DIAG
-	bool "TALIH-PD1 Pass 2 cgroup 初始化诊断"
+	bool "TALIH-PD1 Pass 2 启动内建命令诊断"
 	depends on TALIH_PASS2_SELINUX_DIAG && UPROBES && !CPU_BIG_ENDIAN
 	help
 	  仅在正常 PID 1 已成功加载预期策略时放行一次 second_stage。
-	  只允许第一条本地内建命令 SetupCgroupsAction，并在其返回后停止。
-	  断点安装或身份验证失败时提前停止；不改变恢复模式。
+	  按序核对 cgroup、kptr_restrict 和 perf 探测三个内建命令。
+	  检查每项返回结果，并在任何 early-init RC 动作前停止。
 	  断点只写入新进程的私有内存页，不修改 EROFS 镜像。
-	  保留只读 UFS 保护，不执行任何 RC 动作。
+	  断点或身份验证失败时停止；保留只读 UFS 和恢复模式。
 
 config TALIH_PASS2_UDOT_DIAG
 	bool "TALIH-PD1 Pass 2 向量 UDOT 兼容诊断"
