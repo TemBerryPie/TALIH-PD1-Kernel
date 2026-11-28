@@ -305,11 +305,59 @@ void unregister_undef_hook(struct undef_hook *hook)
 	raw_spin_unlock_irqrestore(&undef_lock, flags);
 }
 
-static int call_undef_hook(struct pt_regs *regs)
+static void talih_pass2_log_undef(struct pt_regs *regs, unsigned long pc,
+				u32 esr, bool fetched, u32 instr,
+				const void *hook, int ret)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+
+	if (!IS_ENABLED(CONFIG_TALIH_PASS2_SELINUX_DIAG) ||
+	    task_pid_nr(current) != 1 || !user_mode(regs))
+		return;
+
+	pr_crit("TALIH_PASS2_DIAG: undef pc=%016lx esr=%08x fetched=%d insn=%08x hook=%ps ret=%d\n",
+		pc, esr, fetched, instr, hook, ret);
+
+	/* 诊断信息不能阻塞正常的信号退出路径。 */
+	if (!mm || !down_read_trylock(&mm->mmap_sem))
+		return;
+	vma = find_vma(mm, pc);
+	if (vma && pc >= vma->vm_start && vma->vm_file) {
+		u64 offset = ((u64)vma->vm_pgoff << PAGE_SHIFT) +
+			     (pc - vma->vm_start);
+
+		pr_crit("TALIH_PASS2_DIAG: undef mapping=%pD3 file_offset=%#llx\n",
+			vma->vm_file, offset);
+	}
+	up_read(&mm->mmap_sem);
+}
+
+static void talih_pass2_log_sigill(struct pt_regs *regs, u32 esr)
+{
+	unsigned long pc = instruction_pointer(regs);
+	__le32 instr = 0;
+	bool fetched;
+
+	if (!IS_ENABLED(CONFIG_TALIH_PASS2_SELINUX_DIAG) ||
+	    task_pid_nr(current) != 1 || !user_mode(regs) ||
+	    compat_user_mode(regs))
+		return;
+
+	pagefault_disable();
+	fetched = !get_user(instr, (__le32 __user *)pc);
+	pagefault_enable();
+	talih_pass2_log_undef(regs, pc, esr, fetched, le32_to_cpu(instr),
+			     NULL, -EOPNOTSUPP);
+}
+
+static int call_undef_hook(struct pt_regs *regs, u32 esr)
 {
 	struct undef_hook *hook;
 	unsigned long flags;
-	u32 instr;
+	u32 instr = 0;
+	bool fetched = false;
+	int ret;
 	int (*fn)(struct pt_regs *regs, u32 instr) = NULL;
 	void __user *pc = (void __user *)instruction_pointer(regs);
 
@@ -341,6 +389,7 @@ static int call_undef_hook(struct pt_regs *regs)
 		instr = le32_to_cpu(instr_le);
 	}
 
+	fetched = true;
 	raw_spin_lock_irqsave(&undef_lock, flags);
 	list_for_each_entry(hook, &undef_hook, node)
 		if ((instr & hook->instr_mask) == hook->instr_val &&
@@ -349,7 +398,11 @@ static int call_undef_hook(struct pt_regs *regs)
 
 	raw_spin_unlock_irqrestore(&undef_lock, flags);
 exit:
-	return fn ? fn(regs, instr) : 1;
+	ret = fn ? fn(regs, instr) : 1;
+	if (ret)
+		talih_pass2_log_undef(regs, (unsigned long)pc, esr, fetched,
+				     instr, fn, ret);
+	return ret;
 }
 
 static void force_signal_inject(int signal, int code, struct pt_regs *regs,
@@ -405,11 +458,14 @@ void arm64_notify_segfault(struct pt_regs *regs, unsigned long addr)
 
 asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 {
+	u32 esr = IS_ENABLED(CONFIG_TALIH_PASS2_SELINUX_DIAG) ?
+		  read_sysreg(esr_el1) : 0;
+
 	/* check for AArch32 breakpoint instructions */
 	if (!aarch32_break_handler(regs))
 		return;
 
-	if (call_undef_hook(regs) == 0)
+	if (call_undef_hook(regs, esr) == 0)
 		return;
 
 	BUG_ON(!user_mode(regs));
@@ -467,6 +523,7 @@ static void user_cache_maint_handler(unsigned int esr, struct pt_regs *regs)
 		__user_cache_maint("ic ivau", address, ret);
 		break;
 	default:
+		talih_pass2_log_sigill(regs, esr);
 		force_signal_inject(SIGILL, ILL_ILLOPC, regs, 0);
 		return;
 	}
@@ -667,6 +724,7 @@ asmlinkage void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
 	pr_crit("Bad EL0 synchronous exception detected on CPU%d, code 0x%08x -- %s\n",
 		smp_processor_id(), esr, esr_get_class_string(esr));
 	__show_regs(regs);
+	talih_pass2_log_sigill(regs, esr);
 
 	info.si_signo = SIGILL;
 	info.si_errno = 0;
