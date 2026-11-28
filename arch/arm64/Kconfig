@@ -1335,10 +1335,11 @@ config TALIH_PASS2_BOOT_DIAG
 
 config TALIH_PASS2_SELINUX_DIAG
 	bool "TALIH-PD1 Pass 2 SELinux 加载诊断"
-	depends on TALIH_PASS2_BOOT_DIAG && SECURITY_SELINUX
+	depends on TALIH_PASS2_BOOT_DIAG && SECURITY_SELINUX && MTK_BOOT=y
 	help
-	  只放行供体 init 的 selinux_setup；在进入 second_stage 前停止。
-	  保留只读 UFS 防护，不执行 vendor 启动脚本。
+	  正常启动只放行供体 init 的 selinux_setup，在 second_stage 前停止。
+	  恢复模式只放行原厂 ramdisk init 的两次交棒，用于验证 fastbootd。
+	  两种模式均保留只读 UFS 防护。
 
 config TALIH_PASS2_UDOT_DIAG
 	bool "TALIH-PD1 Pass 2 向量 UDOT 兼容诊断"

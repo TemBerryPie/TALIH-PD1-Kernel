@@ -81,6 +81,9 @@
 #include <trace/events/sched.h>
 
 #include <mt-plat/mtk_pidmap.h>
+#ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
+#include <mt-plat/mtk_boot_common.h>
+#endif
 #ifdef CONFIG_KSU_MANUAL_HOOK
 __attribute__((hot))
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
@@ -1693,7 +1696,7 @@ static void __noreturn talih_pass2_stop(int err)
 	panic("TALIH_PASS2_DIAG: restart returned");
 }
 
-static int talih_pass2_read_init(struct linux_binprm *bprm)
+static int talih_pass2_read_init(struct linux_binprm *bprm, bool recovery)
 {
 	void *image = NULL;
 	loff_t size;
@@ -1701,7 +1704,7 @@ static int talih_pass2_read_init(struct linux_binprm *bprm)
 	int err;
 
 	if (strcmp(bprm->filename, "/system/bin/init") ||
-	    file_inode(bprm->file)->i_sb->s_magic != 0xe0f5e1e2)
+	    (!recovery && file_inode(bprm->file)->i_sb->s_magic != 0xe0f5e1e2))
 		return -EINVAL;
 
 	err = kernel_read_file(bprm->file, &image, &size, SZ_8M,
@@ -1711,6 +1714,12 @@ static int talih_pass2_read_init(struct linux_binprm *bprm)
 
 	crc = crc32_le(~0U, image, size) ^ ~0U;
 	vfree(image);
+	if (recovery) {
+		pr_info("TALIH_PASS2_DIAG: ramdisk init size=%lld crc32=%08x\n",
+			size, crc);
+		return size == 1053896 && crc == 0x84195cce ? 0 : -EBADMSG;
+	}
+
 	pr_info("TALIH_PASS2_DIAG: EROFS init size=%lld crc32=%08x\n",
 		size, crc);
 	return size == 3599760 && crc == 0xdcdcab01 ? 0 : -EBADMSG;
@@ -1766,6 +1775,41 @@ static void talih_pass2_check_selinux_stage(struct linux_binprm *bprm)
 	if (!talih_pass2_match_args(bprm, setup, sizeof(setup)))
 		talih_pass2_stop(-EINVAL);
 }
+
+static unsigned int talih_pass2_recovery_stage;
+
+static bool talih_pass2_is_recovery(void)
+{
+	return get_boot_mode() == RECOVERY_BOOT &&
+	       !strstr(saved_command_line, "androidboot.force_normal_boot=");
+}
+
+static void talih_pass2_check_recovery_stage(struct linux_binprm *bprm)
+{
+	static const char setup[] = "/system/bin/init\0selinux_setup";
+	static const char next[] = "/system/bin/init\0second_stage";
+	struct file *exe;
+	bool same_path;
+
+	if (talih_pass2_recovery_stage == 0) {
+		if (!talih_pass2_match_args(bprm, setup, sizeof(setup)))
+			talih_pass2_stop(-EINVAL);
+	} else if (talih_pass2_recovery_stage == 1) {
+		if (!talih_pass2_match_args(bprm, next, sizeof(next)))
+			talih_pass2_stop(-EINVAL);
+	} else {
+		talih_pass2_stop(-ECANCELED);
+	}
+
+	/* /init 和这两次恢复态交棒必须解析到同一个 ramdisk 文件。 */
+	exe = get_mm_exe_file(current->mm);
+	if (!exe)
+		talih_pass2_stop(-ENOENT);
+	same_path = path_equal(&exe->f_path, &bprm->file->f_path);
+	fput(exe);
+	if (!same_path)
+		talih_pass2_stop(-EXDEV);
+}
 #endif
 
 static int exec_binprm(struct linux_binprm *bprm)
@@ -1774,12 +1818,17 @@ static int exec_binprm(struct linux_binprm *bprm)
 	int ret;
 #ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
 	bool stop_before_userspace = task_pid_nr(current) == 1 && current->mm;
+	bool recovery = false;
 
 	if (stop_before_userspace) {
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
-		talih_pass2_check_selinux_stage(bprm);
+		recovery = talih_pass2_is_recovery();
+		if (recovery)
+			talih_pass2_check_recovery_stage(bprm);
+		else
+			talih_pass2_check_selinux_stage(bprm);
 #endif
-		ret = talih_pass2_read_init(bprm);
+		ret = talih_pass2_read_init(bprm, recovery);
 		if (ret)
 			talih_pass2_stop(ret);
 	}
@@ -1797,8 +1846,15 @@ static int exec_binprm(struct linux_binprm *bprm)
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
 		if (ret < 0)
 			talih_pass2_stop(ret);
-		talih_pass2_selinux_entered = true;
-		pr_info("TALIH_PASS2_DIAG: entering selinux_setup\n");
+		if (recovery) {
+			talih_pass2_recovery_stage++;
+			pr_info("TALIH_PASS2_DIAG: entering recovery %s\n",
+				talih_pass2_recovery_stage == 1 ? "selinux_setup" :
+				"second_stage");
+		} else {
+			talih_pass2_selinux_entered = true;
+			pr_info("TALIH_PASS2_DIAG: entering selinux_setup\n");
+		}
 #else
 		talih_pass2_stop(ret);
 #endif
