@@ -1339,3 +1339,10 @@ config TALIH_PASS2_SELINUX_DIAG
 	help
 	  只放行供体 init 的 selinux_setup；在进入 second_stage 前停止。
 	  保留只读 UFS 防护，不执行 vendor 启动脚本。
+
+config TALIH_PASS2_UDOT_DIAG
+	bool "TALIH-PD1 Pass 2 向量 UDOT 兼容诊断"
+	depends on TALIH_PASS2_SELINUX_DIAG && !CPU_BIG_ENDIAN
+	help
+	  在仅供诊断的启动中模拟 AArch64 用户态向量 UDOT，
+	  不对用户态公布完整的 DotProd 能力。
