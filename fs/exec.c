@@ -1736,15 +1736,29 @@ static int talih_pass2_read_init(struct linux_binprm *bprm, bool recovery)
 static bool talih_pass2_selinux_entered;
 
 #ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
-#define TALIH_PASS2_SECOND_OFFSET	0x14e938UL
-#define TALIH_PASS2_SECOND_INSN		0x91232529U
 #define TALIH_PASS2_POLICY_SIZE		1327526
+
+/* 文件偏移与 VA 一致；这些布局由供体 init 的长度和 CRC 约束。 */
+#define TALIH_PASS2_CGROUP_ACTION	0x152950UL
+#define TALIH_PASS2_CGROUP_VTABLE	0x3590c0UL
+#define TALIH_PASS2_CGROUP_THUNK		0x111b20UL
+
+struct talih_pass2_probe {
+	unsigned long offset;
+	u32 insn;
+	unsigned long pc;
+	struct uprobe_consumer consumer;
+};
 
 static bool talih_pass2_policy_loaded;
 static bool talih_pass2_second_attempted;
 static struct mm_struct *talih_pass2_second_mm;
-static unsigned long talih_pass2_second_pc;
-static struct callback_head talih_pass2_second_work;
+static unsigned long talih_pass2_init_bias;
+static bool talih_pass2_cgroup_admitted;
+static unsigned long talih_pass2_action;
+static unsigned long talih_pass2_command;
+static struct callback_head talih_pass2_check_work;
+static struct callback_head talih_pass2_return_work;
 
 void talih_pass2_note_policy_load(size_t size)
 {
@@ -1752,24 +1766,93 @@ void talih_pass2_note_policy_load(size_t size)
 		talih_pass2_policy_loaded = size == TALIH_PASS2_POLICY_SIZE;
 }
 
-static void talih_pass2_second_stop(struct callback_head *work)
+static bool talih_pass2_read_user(unsigned long addr, void *buf, size_t size)
 {
-	pr_emerg("TALIH_PASS2_DIAG: RC parse returned, before first action\n");
+	return addr && addr <= TASK_SIZE - size &&
+	       access_process_vm(current, addr, buf, size, 0) == size;
+}
+
+static void talih_pass2_check_action(struct callback_head *work)
+{
+	unsigned long subcontext, command[5], functor[2], invoke;
+	unsigned long action = talih_pass2_action;
+	unsigned long cmd = talih_pass2_command;
+	unsigned long bias = talih_pass2_init_bias;
+
+	/* Action::subcontext_、Command 的 functor 指针与单参数向量。 */
+	if (!action || action > TASK_SIZE - 0x58 ||
+	    !cmd || cmd > TASK_SIZE - 0x48 ||
+	    !talih_pass2_read_user(action + 0x50, &subcontext, sizeof(subcontext)) ||
+	    subcontext || !talih_pass2_read_user(cmd + 0x20, command, sizeof(command)) ||
+	    !command[3] || command[4] > TASK_SIZE || command[4] < command[3] ||
+	    command[4] - command[3] != 24 ||
+	    !talih_pass2_read_user(command[0], functor, sizeof(functor)) ||
+	    functor[0] != bias + TALIH_PASS2_CGROUP_VTABLE ||
+	    functor[1] != bias + TALIH_PASS2_CGROUP_ACTION ||
+	    !talih_pass2_read_user(functor[0] + 0x30, &invoke, sizeof(invoke)) ||
+	    invoke != bias + TALIH_PASS2_CGROUP_THUNK) {
+		pr_emerg("TALIH_PASS2_DIAG: first init action rejected\n");
+		talih_pass2_stop(-ECANCELED);
+	}
+
+	talih_pass2_cgroup_admitted = true;
+	pr_info("TALIH_PASS2_DIAG: only SetupCgroupsAction admitted\n");
+}
+
+static void talih_pass2_cgroup_return(struct callback_head *work)
+{
+	static const char * const paths[] = {
+		"/dev/blkio", "/dev/cpuctl", "/dev/cpuset", "/dev/memcg",
+		"/sys/fs/cgroup", "/sys/fs/cgroup/apps", "/sys/fs/cgroup/system",
+		"/data", "/metadata",
+	};
+	unsigned int i;
+
+	pr_emerg("TALIH_PASS2_DIAG: SetupCgroupsAction returned\n");
+	for (i = 0; i < ARRAY_SIZE(paths); i++) {
+		struct path path;
+		int err = kern_path(paths[i], LOOKUP_FOLLOW, &path);
+
+		if (err) {
+			pr_info("TALIH_PASS2_DIAG: path %s lookup=%d\n",
+				paths[i], err);
+			continue;
+		}
+		pr_info("TALIH_PASS2_DIAG: path %s fstype=%s ro=%d\n",
+			paths[i], path.dentry->d_sb->s_type->name,
+			__mnt_is_readonly(path.mnt));
+		path_put(&path);
+	}
 	talih_pass2_stop(0);
 }
 
-static int talih_pass2_second_hit(struct uprobe_consumer *self,
+static int talih_pass2_action_hit(struct uprobe_consumer *self,
 				  struct pt_regs *regs)
 {
+	struct talih_pass2_probe *probe;
+	struct callback_head *work;
+
 	if (current->mm != READ_ONCE(talih_pass2_second_mm))
 		return 0;
-	if (task_pid_nr(current) != 1 ||
-	    instruction_pointer(regs) != talih_pass2_second_pc)
-		panic("TALIH_PASS2_DIAG: unexpected RC parse probe hit");
+	probe = container_of(self, struct talih_pass2_probe, consumer);
+	if (task_pid_nr(current) != 1 || instruction_pointer(regs) != probe->pc)
+		panic("TALIH_PASS2_DIAG: unexpected cgroup probe hit");
 
-	/* 离开 uprobe 锁后、返回用户态前执行重启。 */
-	if (task_work_add(current, &talih_pass2_second_work, true))
-		panic("TALIH_PASS2_DIAG: failed to queue RC parse stop");
+	if (probe->offset == 0xe8870UL) {
+		if (talih_pass2_cgroup_admitted)
+			panic("TALIH_PASS2_DIAG: second init action blocked");
+		talih_pass2_action = regs->regs[0];
+		talih_pass2_command = regs->regs[1];
+		work = &talih_pass2_check_work;
+	} else {
+		if (!talih_pass2_cgroup_admitted || regs->regs[30] != probe->pc)
+			panic("TALIH_PASS2_DIAG: unverified builtin return blocked");
+		work = &talih_pass2_return_work;
+	}
+
+	/* 在持锁回调之外、返回用户态之前检查命令或重启。 */
+	if (task_work_add(current, work, true))
+		panic("TALIH_PASS2_DIAG: failed to queue cgroup probe work");
 	return 0;
 }
 
@@ -1780,23 +1863,31 @@ static bool talih_pass2_second_filter(struct uprobe_consumer *self,
 	return mm == READ_ONCE(talih_pass2_second_mm);
 }
 
-static struct uprobe_consumer talih_pass2_second_probe = {
-	.handler = talih_pass2_second_hit,
-	.filter = talih_pass2_second_filter,
+static struct talih_pass2_probe talih_pass2_action_probes[] = {
+	{
+		.offset = 0xe8870UL,
+		.insn = 0xd10383ffU,
+		.consumer = {
+			.handler = talih_pass2_action_hit,
+			.filter = talih_pass2_second_filter,
+		},
+	}, {
+		.offset = 0xe77fcUL,
+		.insn = 0xf94003f3U,
+		.consumer = {
+			.handler = talih_pass2_action_hit,
+			.filter = talih_pass2_second_filter,
+		},
+	},
 };
 
-static int talih_pass2_arm_second_stage(struct file *file)
+static int talih_pass2_arm_action_probe(struct mm_struct *mm, struct inode *inode,
+					struct talih_pass2_probe *probe)
 {
-	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
-	struct inode *inode;
 	unsigned long addr = 0;
 	__le32 insn;
 	int ret;
-
-	if (!mm || !file)
-		return -EINVAL;
-	inode = file_inode(file);
 
 	down_read(&mm->mmap_sem);
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
@@ -1804,33 +1895,56 @@ static int talih_pass2_arm_second_stage(struct file *file)
 
 		if (!vma->vm_file || file_inode(vma->vm_file) != inode ||
 		    (vma->vm_flags & (VM_EXEC | VM_WRITE)) != VM_EXEC ||
-		    vma->vm_pgoff > (TALIH_PASS2_SECOND_OFFSET >> PAGE_SHIFT))
+		    vma->vm_pgoff > (probe->offset >> PAGE_SHIFT))
 			continue;
-		delta = TALIH_PASS2_SECOND_OFFSET - (vma->vm_pgoff << PAGE_SHIFT);
+		delta = probe->offset - (vma->vm_pgoff << PAGE_SHIFT);
 		if (delta + sizeof(insn) <= vma->vm_end - vma->vm_start) {
 			addr = vma->vm_start + delta;
 			break;
 		}
 	}
 	up_read(&mm->mmap_sem);
-	if (!addr || access_process_vm(current, addr, &insn, sizeof(insn), 0) !=
-	    sizeof(insn) || le32_to_cpu(insn) != TALIH_PASS2_SECOND_INSN)
+	if (addr < probe->offset ||
+	    !talih_pass2_read_user(addr, &insn, sizeof(insn)) ||
+	    le32_to_cpu(insn) != probe->insn)
 		return -ENOEXEC;
 
-	talih_pass2_second_pc = addr;
-	init_task_work(&talih_pass2_second_work, talih_pass2_second_stop);
-	WRITE_ONCE(talih_pass2_second_mm, mm);
-	ret = uprobe_register(inode, TALIH_PASS2_SECOND_OFFSET,
-			      &talih_pass2_second_probe);
+	probe->pc = addr;
+	ret = uprobe_register(inode, probe->offset, &probe->consumer);
 	if (ret)
 		return ret;
-
-	/* 先回读新地址空间，不能把注册成功当成断点一定安装成功。 */
-	if (access_process_vm(current, addr, &insn, sizeof(insn), 0) !=
-	    sizeof(insn) || le32_to_cpu(insn) != UPROBE_SWBP_INSN)
+	if (!talih_pass2_read_user(addr, &insn, sizeof(insn)) ||
+	    le32_to_cpu(insn) != UPROBE_SWBP_INSN)
 		return -EIO;
-	pr_info("TALIH_PASS2_DIAG: RC parse probe armed at file +0x%lx\n",
-		TALIH_PASS2_SECOND_OFFSET);
+	return 0;
+}
+
+static int talih_pass2_arm_second_stage(struct file *file)
+{
+	struct mm_struct *mm = current->mm;
+	struct inode *inode;
+	unsigned int i;
+	int ret;
+
+	if (!mm || !file)
+		return -EINVAL;
+	inode = file_inode(file);
+	init_task_work(&talih_pass2_check_work, talih_pass2_check_action);
+	init_task_work(&talih_pass2_return_work, talih_pass2_cgroup_return);
+	WRITE_ONCE(talih_pass2_second_mm, mm);
+	for (i = 0; i < ARRAY_SIZE(talih_pass2_action_probes); i++) {
+		struct talih_pass2_probe *probe = &talih_pass2_action_probes[i];
+		unsigned long bias;
+
+		ret = talih_pass2_arm_action_probe(mm, inode, probe);
+		if (ret)
+			return ret;
+		bias = probe->pc - probe->offset;
+		if (i && bias != talih_pass2_init_bias)
+			return -ENOEXEC;
+		talih_pass2_init_bias = bias;
+	}
+	pr_info("TALIH_PASS2_DIAG: cgroup action gate and return probe armed\n");
 	return 0;
 }
 #endif
@@ -1973,7 +2087,7 @@ static int exec_binprm(struct linux_binprm *bprm)
 #ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
 			ret = talih_pass2_arm_second_stage(bprm->file);
 			if (ret) {
-				pr_emerg("TALIH_PASS2_DIAG: RC parse probe not armed\n");
+				pr_emerg("TALIH_PASS2_DIAG: cgroup probes not armed\n");
 				talih_pass2_stop(ret);
 			}
 #else
