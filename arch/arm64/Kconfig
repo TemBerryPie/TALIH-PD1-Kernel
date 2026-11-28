@@ -1342,14 +1342,14 @@ config TALIH_PASS2_SELINUX_DIAG
 	  两种模式均保留只读 UFS 防护。
 
 config TALIH_PASS2_SECOND_STAGE_DIAG
-	bool "TALIH-PD1 Pass 2 early-init 诊断"
+	bool "TALIH-PD1 Pass 2 ueventd 冷启动诊断"
 	depends on TALIH_PASS2_SELINUX_DIAG && UPROBES && !CPU_BIG_ENDIAN
 	help
 	  仅在正常 PID 1 已成功加载预期策略时放行一次 second_stage。
-	  按序核对三个启动内建命令及主 early-init RC 的固定前缀。
-	  记录每项返回结果，在启动 ueventd 或其他服务之前停止。
+	  按序核对启动内建命令、主 early-init 前缀和一次 ueventd 启动。
+	  分别记录 exec、配置与冷启动 worker，发布完成属性前停机。
 	  断点只写入新进程的私有内存页，不修改 EROFS 镜像。
-	  断点或身份验证失败时停止；保留只读 UFS 和恢复模式。
+	  保留只读 UFS 和恢复模式；诊断窗口拒绝其他 exec 与挂载。
 
 config TALIH_PASS2_UDOT_DIAG
 	bool "TALIH-PD1 Pass 2 向量 UDOT 兼容诊断"

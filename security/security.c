@@ -28,6 +28,7 @@
 #include <linux/personality.h>
 #include <linux/backing-dev.h>
 #include <linux/string.h>
+#include <linux/talih_pass2_diag.h>
 #include <net/flow.h>
 
 #define MAX_LSM_EVM_XATTR	2
@@ -393,6 +394,10 @@ int security_sb_statfs(struct dentry *dentry)
 int security_sb_mount(const char *dev_name, const struct path *path,
                        const char *type, unsigned long flags, void *data)
 {
+	if (talih_pass2_service_window()) {
+		pr_warn_once("TALIH_PASS2_DIAG: mount blocked during ueventd\n");
+		return -EPERM;
+	}
 	return call_int_hook(sb_mount, 0, dev_name, path, type, flags, data);
 }
 

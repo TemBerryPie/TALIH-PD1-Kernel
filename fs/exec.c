@@ -68,9 +68,11 @@
 #include <linux/sizes.h>
 #endif
 #ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+#include <linux/completion.h>
 #include <linux/talih_pass2_diag.h>
 #include <linux/task_work.h>
 #include <linux/uprobes.h>
+#include <linux/workqueue.h>
 #include <asm/ptrace.h>
 #endif
 
@@ -1789,6 +1791,7 @@ static const struct talih_pass2_rc_command talih_pass2_early_init[] = {
 	{ 89, { "chmod", "644", "/linkerconfig/bootstrap/ld.config.txt" } },
 	{ 90, { "chmod", "644", "/linkerconfig/default/ld.config.txt" } },
 	{ 93, { "mount", "none", "/linkerconfig/bootstrap", "/linkerconfig", "bind", "rec" } },
+	{ 95, { "start", "ueventd" } },
 };
 
 struct talih_pass2_probe {
@@ -1810,6 +1813,33 @@ static unsigned long talih_pass2_command;
 static unsigned long talih_pass2_result;
 static struct callback_head talih_pass2_check_work;
 static struct callback_head talih_pass2_return_work;
+
+static struct inode *talih_pass2_init_inode;
+static struct task_struct *talih_pass2_ueventd_task;
+static struct mm_struct *talih_pass2_ueventd_mm;
+static unsigned long talih_pass2_config_path;
+static bool talih_pass2_config_ok;
+static struct callback_head talih_pass2_config_work;
+static struct callback_head talih_pass2_ueventd_park_work;
+static DECLARE_COMPLETION(talih_pass2_ueventd_done);
+static DECLARE_COMPLETION(talih_pass2_ueventd_parked);
+static bool talih_pass2_ueventd_enabled;
+static unsigned int talih_pass2_ueventd_phase;
+static unsigned int talih_pass2_worker_forks;
+static unsigned int talih_pass2_worker_reaps;
+static int talih_pass2_ueventd_result;
+
+static void talih_pass2_ueventd_timeout(struct work_struct *work)
+{
+	pr_emerg("TALIH_PASS2_DIAG: ueventd deadline, phase=%u forks=%u reaps=%u\n",
+		 READ_ONCE(talih_pass2_ueventd_phase),
+		 READ_ONCE(talih_pass2_worker_forks),
+		 READ_ONCE(talih_pass2_worker_reaps));
+	talih_pass2_stop(-ETIMEDOUT);
+}
+
+static DECLARE_DELAYED_WORK(talih_pass2_ueventd_watchdog,
+			    talih_pass2_ueventd_timeout);
 
 void talih_pass2_note_policy_load(size_t size)
 {
@@ -1898,6 +1928,12 @@ static void talih_pass2_check_action(struct callback_head *work)
 		reason = "early-init source or arguments";
 		if (!command[0] || !talih_pass2_match_rc(entry, action, cmd, begin, end))
 			goto reject;
+		if (entry->line == 95) {
+			if (!schedule_delayed_work(&talih_pass2_ueventd_watchdog, 35 * HZ))
+				talih_pass2_stop(-EBUSY);
+			/* 向子任务发布 watchdog 和 init 身份。 */
+			smp_store_release(&talih_pass2_ueventd_enabled, true);
+		}
 		pr_info("TALIH_PASS2_DIAG: early-init line %u %s admitted\n",
 			entry->line, entry->args[0]);
 	} else {
@@ -1976,15 +2012,29 @@ static void talih_pass2_action_return(struct callback_head *work)
 		pr_info("TALIH_PASS2_DIAG: early-init line %u %s returned, result=%u\n",
 			entry->line, entry->args[0], tag);
 		talih_pass2_rc_errors += tag;
+		if (tag && entry->line != 17 && entry->line != 39) {
+			if (entry->line == 95)
+				cancel_delayed_work_sync(&talih_pass2_ueventd_watchdog);
+			talih_pass2_report_mounts();
+			talih_pass2_stop(-ECANCELED);
+		}
 	}
 
 	talih_pass2_action_active = false;
 	if (++talih_pass2_next_action == ARRAY_SIZE(talih_pass2_builtins) +
 	    ARRAY_SIZE(talih_pass2_early_init)) {
-		pr_emerg("TALIH_PASS2_DIAG: early-init prefix returned, before ueventd; errors=%u\n",
-			 talih_pass2_rc_errors);
+		int status = -ETIMEDOUT;
+
+		pr_info("TALIH_PASS2_DIAG: init start ueventd returned; waiting for child\n");
+		if (wait_for_completion_timeout(&talih_pass2_ueventd_done, 30 * HZ))
+			status = talih_pass2_ueventd_result;
+		cancel_delayed_work_sync(&talih_pass2_ueventd_watchdog);
+		pr_emerg("TALIH_PASS2_DIAG: ueventd boundary before tracefs and APEX; status=%d phase=%u forks=%u reaps=%u rc_errors=%u\n",
+			 status, READ_ONCE(talih_pass2_ueventd_phase),
+			 READ_ONCE(talih_pass2_worker_forks),
+			 READ_ONCE(talih_pass2_worker_reaps), talih_pass2_rc_errors);
 		talih_pass2_report_mounts();
-		talih_pass2_stop(0);
+		talih_pass2_stop(status);
 	}
 }
 
@@ -2049,6 +2099,129 @@ static struct talih_pass2_probe talih_pass2_action_probes[] = {
 	},
 };
 
+static void talih_pass2_report_ueventd_config(struct callback_head *work)
+{
+	static const char * const paths[] = {
+		"/system/etc/ueventd.rc", "/vendor/etc/ueventd.rc",
+		"/odm/etc/ueventd.rc", "/vendor/ueventd.rc", "/odm/ueventd.rc",
+	};
+	const char *name = "other";
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(paths); i++) {
+		if (talih_pass2_match_string(talih_pass2_config_path, paths[i])) {
+			name = paths[i];
+			break;
+		}
+	}
+	pr_info("TALIH_PASS2_DIAG: ueventd config %s parsed=%d\n",
+		name, talih_pass2_config_ok);
+}
+
+static void talih_pass2_park_ueventd(struct callback_head *work)
+{
+	if (!talih_pass2_worker_forks ||
+	    talih_pass2_worker_forks != talih_pass2_worker_reaps)
+		talih_pass2_ueventd_result = -ECHILD;
+	WRITE_ONCE(talih_pass2_ueventd_phase, 4);
+	pr_info("TALIH_PASS2_DIAG: ueventd at coldboot pre-publish; forks=%u reaps=%u\n",
+		talih_pass2_worker_forks, talih_pass2_worker_reaps);
+	complete(&talih_pass2_ueventd_done);
+
+	/* 主任务或独立超时工作统一结束诊断，不返回 EL0 发布属性。 */
+	wait_for_completion(&talih_pass2_ueventd_parked);
+}
+
+static bool talih_pass2_ueventd_filter(struct uprobe_consumer *self,
+				       enum uprobe_filter_ctx ctx,
+				       struct mm_struct *mm)
+{
+	return mm == READ_ONCE(talih_pass2_ueventd_mm);
+}
+
+#define TALIH_UEVENTD_MAIN	0x19c1c0UL
+#define TALIH_UEVENTD_CFG_ITEM	0x1a5d50UL
+#define TALIH_UEVENTD_CFG_DONE	0x19c750UL
+#define TALIH_UEVENTD_FORK_RET	0x19d4d0UL
+#define TALIH_UEVENTD_REAP_OK	0x19d778UL
+#define TALIH_UEVENTD_PUBLISH	0x19d860UL
+
+static int talih_pass2_ueventd_hit(struct uprobe_consumer *self,
+				   struct pt_regs *regs)
+{
+	struct talih_pass2_probe *probe;
+	struct callback_head *work = NULL;
+
+	if (current->mm != READ_ONCE(talih_pass2_ueventd_mm))
+		return 0;
+	probe = container_of(self, struct talih_pass2_probe, consumer);
+	if (current != READ_ONCE(talih_pass2_ueventd_task) ||
+	    instruction_pointer(regs) != probe->pc)
+		panic("TALIH_PASS2_DIAG: unexpected ueventd probe hit");
+
+	switch (probe->offset) {
+	case TALIH_UEVENTD_MAIN:
+		if (talih_pass2_ueventd_phase != 1)
+			goto reject;
+		WRITE_ONCE(talih_pass2_ueventd_phase, 2);
+		pr_info("TALIH_PASS2_DIAG: ueventd_main reached\n");
+		break;
+	case TALIH_UEVENTD_CFG_ITEM:
+		if (talih_pass2_ueventd_phase != 2 || regs->regs[30] != probe->pc)
+			goto reject;
+		talih_pass2_config_ok = (u32)regs->regs[0] != 0;
+		talih_pass2_config_path = regs->regs[20];
+		work = &talih_pass2_config_work;
+		break;
+	case TALIH_UEVENTD_CFG_DONE:
+		if (talih_pass2_ueventd_phase != 2 || regs->regs[30] != probe->pc)
+			goto reject;
+		WRITE_ONCE(talih_pass2_ueventd_phase, 3);
+		pr_info("TALIH_PASS2_DIAG: ueventd config stage returned\n");
+		break;
+	case TALIH_UEVENTD_FORK_RET:
+		if (talih_pass2_ueventd_phase != 3 || regs->regs[30] != probe->pc)
+			goto reject;
+		if ((s32)regs->regs[0] > 0)
+			WRITE_ONCE(talih_pass2_worker_forks, talih_pass2_worker_forks + 1);
+		break;
+	case TALIH_UEVENTD_REAP_OK:
+		if (talih_pass2_ueventd_phase != 3 ||
+		    talih_pass2_worker_reaps >= talih_pass2_worker_forks)
+			goto reject;
+		WRITE_ONCE(talih_pass2_worker_reaps, talih_pass2_worker_reaps + 1);
+		break;
+	case TALIH_UEVENTD_PUBLISH:
+		if (talih_pass2_ueventd_phase != 3)
+			goto reject;
+		work = &talih_pass2_ueventd_park_work;
+		break;
+	default:
+		goto reject;
+	}
+	if (work && task_work_add(current, work, true))
+		goto reject;
+	return 0;
+
+reject:
+	panic("TALIH_PASS2_DIAG: unexpected ueventd probe sequence");
+}
+
+#define TALIH_UEVENTD_PROBE(addr, word) { \
+	.offset = (addr), .insn = (word), \
+	.consumer = { .handler = talih_pass2_ueventd_hit, \
+		      .filter = talih_pass2_ueventd_filter }, \
+}
+
+static struct talih_pass2_probe talih_pass2_ueventd_probes[] = {
+	TALIH_UEVENTD_PROBE(TALIH_UEVENTD_MAIN, 0xa9ba7bfdU),
+	TALIH_UEVENTD_PROBE(TALIH_UEVENTD_CFG_ITEM, 0x91006294U),
+	TALIH_UEVENTD_PROBE(TALIH_UEVENTD_CFG_DONE, 0xf94033f7U),
+	TALIH_UEVENTD_PROBE(TALIH_UEVENTD_FORK_RET, 0x2a0003f7U),
+	TALIH_UEVENTD_PROBE(TALIH_UEVENTD_REAP_OK, 0xf940070aU),
+	TALIH_UEVENTD_PROBE(TALIH_UEVENTD_PUBLISH, 0x390497ffU),
+};
+
 static int talih_pass2_arm_action_probe(struct mm_struct *mm, struct inode *inode,
 					struct talih_pass2_probe *probe)
 {
@@ -2097,6 +2270,7 @@ static int talih_pass2_arm_second_stage(struct file *file)
 	if (!mm || !file)
 		return -EINVAL;
 	inode = file_inode(file);
+	talih_pass2_init_inode = inode;
 	init_task_work(&talih_pass2_check_work, talih_pass2_check_action);
 	init_task_work(&talih_pass2_return_work, talih_pass2_action_return);
 	WRITE_ONCE(talih_pass2_second_mm, mm);
@@ -2115,15 +2289,77 @@ static int talih_pass2_arm_second_stage(struct file *file)
 	pr_info("TALIH_PASS2_DIAG: startup builtin gate and return probe armed\n");
 	return 0;
 }
+
+bool talih_pass2_service_window(void)
+{
+	/* 与 L95 准入时发布的诊断窗口配对。 */
+	return smp_load_acquire(&talih_pass2_ueventd_enabled);
+}
+
+static int talih_pass2_arm_ueventd(struct file *file)
+{
+	static const char domain[] = "u:r:ueventd:s0";
+	struct mm_struct *mm = current->mm;
+	unsigned long pc = instruction_pointer(current_pt_regs());
+	struct vm_area_struct *vma;
+	struct path linker;
+	unsigned long bias = 0;
+	char *ctx;
+	u32 sid, len;
+	unsigned int i;
+	bool match;
+	int ret;
+
+	if (!file || file_inode(file) != talih_pass2_init_inode ||
+	    !mm || mm == talih_pass2_second_mm)
+		return -EXDEV;
+	ret = kern_path("/system/bin/bootstrap/linker64", LOOKUP_FOLLOW, &linker);
+	if (ret)
+		return ret;
+	down_read(&mm->mmap_sem);
+	vma = find_vma(mm, pc);
+	match = vma && pc >= vma->vm_start && (vma->vm_flags & VM_EXEC) &&
+		vma->vm_file && path_equal(&vma->vm_file->f_path, &linker);
+	up_read(&mm->mmap_sem);
+	path_put(&linker);
+	if (!match)
+		return -ENOEXEC;
+
+	security_task_getsecid(current, &sid);
+	ret = security_secid_to_secctx(sid, &ctx, &len);
+	if (ret)
+		return ret;
+	match = (len == sizeof(domain) || len == sizeof(domain) - 1) &&
+		!memcmp(ctx, domain, len);
+	security_release_secctx(ctx, len);
+	if (!match)
+		return -EACCES;
+
+	/* 本次诊断仅执行一次，到机器重启为止持有任务和 mm 身份。 */
+	mmgrab(mm);
+	WRITE_ONCE(talih_pass2_ueventd_mm, mm);
+	init_task_work(&talih_pass2_config_work, talih_pass2_report_ueventd_config);
+	init_task_work(&talih_pass2_ueventd_park_work, talih_pass2_park_ueventd);
+	for (i = 0; i < ARRAY_SIZE(talih_pass2_ueventd_probes); i++) {
+		struct talih_pass2_probe *probe = &talih_pass2_ueventd_probes[i];
+
+		ret = talih_pass2_arm_action_probe(mm, file_inode(file), probe);
+		if (ret)
+			return ret;
+		if (i && bias != probe->pc - probe->offset)
+			return -ENOEXEC;
+		bias = probe->pc - probe->offset;
+	}
+	WRITE_ONCE(talih_pass2_ueventd_phase, 1);
+	pr_info("TALIH_PASS2_DIAG: ueventd exec committed; bootstrap linker, domain and probes verified\n");
+	return 0;
+}
 #endif
 
-static bool talih_pass2_match_args(struct linux_binprm *bprm,
+static bool talih_pass2_match_argv(struct linux_binprm *bprm,
 				  const char *args, size_t size)
 {
 	unsigned long pos = bprm->p;
-
-	if (bprm->argc != 2 || strcmp(bprm->filename, "/system/bin/init"))
-		return false;
 
 	/* 从已复制到新进程栈上的参数读取，不再访问原用户指针。 */
 	while (size) {
@@ -2147,6 +2383,41 @@ static bool talih_pass2_match_args(struct linux_binprm *bprm,
 	}
 	return true;
 }
+
+static bool talih_pass2_match_args(struct linux_binprm *bprm,
+				  const char *args, size_t size)
+{
+	return bprm->argc == 2 && !strcmp(bprm->filename, "/system/bin/init") &&
+	       talih_pass2_match_argv(bprm, args, size);
+}
+
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+static int talih_pass2_check_service_exec(struct linux_binprm *bprm)
+{
+	static const char ueventd[] = "/system/bin/ueventd";
+	bool child;
+
+	if (!talih_pass2_service_window())
+		return 0;
+
+	rcu_read_lock();
+	child = task_tgid_nr(rcu_dereference(current->real_parent)) == 1;
+	rcu_read_unlock();
+
+	/* 此窗口只允许已验证 init 的一次 ueventd 交棒；也拦内核 helper。 */
+	if (child && current->mm && current->mm != talih_pass2_second_mm &&
+	    file_inode(bprm->file) == talih_pass2_init_inode && bprm->argc == 1 &&
+	    !strcmp(bprm->filename, ueventd) &&
+	    talih_pass2_match_argv(bprm, ueventd, sizeof(ueventd)) &&
+	    !cmpxchg(&talih_pass2_ueventd_task, NULL, current)) {
+		get_task_struct(current);
+		return 1;
+	}
+
+	pr_warn_once("TALIH_PASS2_DIAG: unapproved exec blocked during ueventd\n");
+	return -EPERM;
+}
+#endif
 
 static bool talih_pass2_check_selinux_stage(struct linux_binprm *bprm)
 {
@@ -2219,6 +2490,12 @@ static int exec_binprm(struct linux_binprm *bprm)
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
 	bool second_stage = false;
 #endif
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+	int service_exec = talih_pass2_check_service_exec(bprm);
+
+	if (service_exec < 0)
+		return service_exec;
+#endif
 
 	if (stop_before_userspace) {
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
@@ -2241,6 +2518,21 @@ static int exec_binprm(struct linux_binprm *bprm)
 	rcu_read_unlock();
 
 	ret = search_binary_handler(bprm);
+#ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
+	if (service_exec > 0) {
+		if (ret >= 0)
+			ret = talih_pass2_arm_ueventd(bprm->file);
+		if (ret < 0) {
+			pr_emerg("TALIH_PASS2_DIAG: ueventd exec or probe setup failed: %d\n",
+				 ret);
+			talih_pass2_ueventd_result = ret;
+			complete(&talih_pass2_ueventd_done);
+			/* 即使新 mm 已提交，也不得进入未布防的用户态。 */
+			for (;;)
+				wait_for_completion(&talih_pass2_ueventd_parked);
+		}
+	}
+#endif
 #ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
 	if (stop_before_userspace) {
 #ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG

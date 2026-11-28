@@ -6,9 +6,15 @@
 
 #ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
 void talih_pass2_note_policy_load(size_t size);
+bool talih_pass2_service_window(void);
 #else
 static inline void talih_pass2_note_policy_load(size_t size)
 {
+}
+
+static inline bool talih_pass2_service_window(void)
+{
+	return false;
 }
 #endif
 
