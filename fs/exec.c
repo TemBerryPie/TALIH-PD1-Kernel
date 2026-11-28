@@ -1742,6 +1742,7 @@ static bool talih_pass2_selinux_entered;
 #define TALIH_PASS2_CGROUP_ACTION	0x152950UL
 #define TALIH_PASS2_CGROUP_VTABLE	0x3590c0UL
 #define TALIH_PASS2_CGROUP_THUNK		0x111b20UL
+#define TALIH_PASS2_ACTION_CALL_RET	0xe87a8UL
 
 struct talih_pass2_probe {
 	unsigned long offset;
@@ -1768,35 +1769,50 @@ void talih_pass2_note_policy_load(size_t size)
 
 static bool talih_pass2_read_user(unsigned long addr, void *buf, size_t size)
 {
+	addr = untagged_addr(addr);
 	return addr && addr <= TASK_SIZE - size &&
 	       access_process_vm(current, addr, buf, size, 0) == size;
 }
 
 static void talih_pass2_check_action(struct callback_head *work)
 {
-	unsigned long subcontext, command[5], functor[2], invoke;
-	unsigned long action = talih_pass2_action;
-	unsigned long cmd = talih_pass2_command;
+	unsigned long subcontext, command[5], functor[2], invoke, begin, end;
+	unsigned long action = untagged_addr(talih_pass2_action);
+	unsigned long cmd = untagged_addr(talih_pass2_command);
 	unsigned long bias = talih_pass2_init_bias;
+	const char *reason;
 
-	/* Action::subcontext_、Command 的 functor 指针与单参数向量。 */
+	/* 供体堆指针带 TBI 标签；GUP 和范围检查使用去标签地址。 */
+	reason = "object read";
 	if (!action || action > TASK_SIZE - 0x58 ||
 	    !cmd || cmd > TASK_SIZE - 0x48 ||
 	    !talih_pass2_read_user(action + 0x50, &subcontext, sizeof(subcontext)) ||
-	    subcontext || !talih_pass2_read_user(cmd + 0x20, command, sizeof(command)) ||
-	    !command[3] || command[4] > TASK_SIZE || command[4] < command[3] ||
-	    command[4] - command[3] != 24 ||
-	    !talih_pass2_read_user(command[0], functor, sizeof(functor)) ||
+	    !talih_pass2_read_user(cmd + 0x20, command, sizeof(command)))
+		goto reject;
+
+	reason = "subcontext or argument count";
+	begin = untagged_addr(command[3]);
+	end = untagged_addr(command[4]);
+	if (subcontext || !begin || end > TASK_SIZE || end < begin ||
+	    end - begin != 24)
+		goto reject;
+
+	reason = "builtin identity";
+	if (!talih_pass2_read_user(command[0], functor, sizeof(functor)) ||
 	    functor[0] != bias + TALIH_PASS2_CGROUP_VTABLE ||
 	    functor[1] != bias + TALIH_PASS2_CGROUP_ACTION ||
 	    !talih_pass2_read_user(functor[0] + 0x30, &invoke, sizeof(invoke)) ||
-	    invoke != bias + TALIH_PASS2_CGROUP_THUNK) {
-		pr_emerg("TALIH_PASS2_DIAG: first init action rejected\n");
-		talih_pass2_stop(-ECANCELED);
-	}
+	    invoke != bias + TALIH_PASS2_CGROUP_THUNK)
+		goto reject;
 
 	talih_pass2_cgroup_admitted = true;
-	pr_info("TALIH_PASS2_DIAG: only SetupCgroupsAction admitted\n");
+	pr_info("TALIH_PASS2_DIAG: only SetupCgroupsAction admitted; tags action=%d args=%d\n",
+		action != talih_pass2_action, begin != command[3]);
+	return;
+
+reject:
+	pr_emerg("TALIH_PASS2_DIAG: first init action rejected: %s\n", reason);
+	talih_pass2_stop(-ECANCELED);
 }
 
 static void talih_pass2_cgroup_return(struct callback_head *work)
@@ -1841,6 +1857,8 @@ static int talih_pass2_action_hit(struct uprobe_consumer *self,
 	if (probe->offset == 0xe8870UL) {
 		if (talih_pass2_cgroup_admitted)
 			panic("TALIH_PASS2_DIAG: second init action blocked");
+		if (regs->regs[30] != talih_pass2_init_bias + TALIH_PASS2_ACTION_CALL_RET)
+			panic("TALIH_PASS2_DIAG: unexpected init action caller");
 		talih_pass2_action = regs->regs[0];
 		talih_pass2_command = regs->regs[1];
 		work = &talih_pass2_check_work;
