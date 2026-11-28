@@ -1322,3 +1322,13 @@ source "arch/arm64/crypto/Kconfig"
 endif
 
 source "lib/Kconfig"
+
+config TALIH_PASS2_BOOT_DIAG
+	bool "TALIH-PD1 Pass 2 只读启动诊断"
+	depends on SCSI_UFSHCD=y && BLK_DEV_SD=y && EROFS_FS=y
+	depends on !UFSFEATURE && !KSU
+	select CRC32
+	help
+	  只读访问 UFS。在 Android 第一阶段 init 尝试交棒时，
+	  校验 EROFS 上的供体 init 并停在其用户态入口前。
+	  此选项仅用于诊断镜像，不能用于正常启动。

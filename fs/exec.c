@@ -62,6 +62,11 @@
 #include <linux/oom.h>
 #include <linux/compat.h>
 #include <linux/vmalloc.h>
+#ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
+#include <linux/crc32.h>
+#include <linux/reboot.h>
+#include <linux/sizes.h>
+#endif
 
 #include <linux/uaccess.h>
 #ifdef CONFIG_KSU_SUSFS
@@ -1679,10 +1684,52 @@ int search_binary_handler(struct linux_binprm *bprm)
 }
 EXPORT_SYMBOL(search_binary_handler);
 
+#ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
+static void __noreturn talih_pass2_stop(int err)
+{
+	pr_emerg("TALIH_PASS2_DIAG: handoff=%d; stopping before donor userspace\n",
+		 err);
+	kernel_restart("bootloader");
+	panic("TALIH_PASS2_DIAG: restart returned");
+}
+
+static int talih_pass2_read_init(struct linux_binprm *bprm)
+{
+	void *image = NULL;
+	loff_t size;
+	u32 crc;
+	int err;
+
+	if (strcmp(bprm->filename, "/system/bin/init") ||
+	    file_inode(bprm->file)->i_sb->s_magic != 0xe0f5e1e2)
+		return -EINVAL;
+
+	err = kernel_read_file(bprm->file, &image, &size, SZ_8M,
+			       READING_UNKNOWN);
+	if (err)
+		return err;
+
+	crc = crc32_le(~0U, image, size) ^ ~0U;
+	vfree(image);
+	pr_info("TALIH_PASS2_DIAG: EROFS init size=%lld crc32=%08x\n",
+		size, crc);
+	return size == 3599760 && crc == 0xdcdcab01 ? 0 : -EBADMSG;
+}
+#endif
+
 static int exec_binprm(struct linux_binprm *bprm)
 {
 	pid_t old_pid, old_vpid;
 	int ret;
+#ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
+	bool stop_before_userspace = task_pid_nr(current) == 1 && current->mm;
+
+	if (stop_before_userspace) {
+		ret = talih_pass2_read_init(bprm);
+		if (ret)
+			talih_pass2_stop(ret);
+	}
+#endif
 
 	/* Need to fetch pid before load_binary changes it */
 	old_pid = current->pid;
@@ -1691,6 +1738,10 @@ static int exec_binprm(struct linux_binprm *bprm)
 	rcu_read_unlock();
 
 	ret = search_binary_handler(bprm);
+#ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
+	if (stop_before_userspace)
+		talih_pass2_stop(ret);
+#endif
 	if (ret >= 0) {
 		audit_bprm(bprm);
 		trace_sched_process_exec(current, old_pid, bprm);

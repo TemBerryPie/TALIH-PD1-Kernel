@@ -2794,6 +2794,34 @@ static inline u16 ufshcd_upiu_wlun_to_scsi_wlun(u8 upiu_wlun_id)
 }
 */
 
+#ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
+static bool ufshcd_pass2_readonly_cmd(const struct scsi_cmnd *cmd)
+{
+	if (cmd->sc_data_direction != DMA_FROM_DEVICE &&
+	    cmd->sc_data_direction != DMA_NONE)
+		return false;
+
+	switch (cmd->cmnd[0]) {
+	case SERVICE_ACTION_IN_16:
+		return (cmd->cmnd[1] & 0x1f) == SAI_READ_CAPACITY_16;
+	case INQUIRY:
+	case MODE_SENSE:
+	case MODE_SENSE_10:
+	case READ_6:
+	case READ_10:
+	case READ_12:
+	case READ_16:
+	case READ_CAPACITY:
+	case REPORT_LUNS:
+	case REQUEST_SENSE:
+	case TEST_UNIT_READY:
+		return true;
+	default:
+		return false;
+	}
+}
+#endif
+
 /**
  * ufshcd_queuecommand - main entry point for SCSI requests
  * @cmd: command from SCSI Midlayer
@@ -2819,6 +2847,18 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
 #endif
 
 	hba = shost_priv(host);
+
+#ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
+	if (!ufshcd_pass2_readonly_cmd(cmd)) {
+		dev_warn_ratelimited(hba->dev, "TALIH_PASS2_DIAG: UFS denied opcode 0x%02x\n",
+				     cmd->cmnd[0]);
+		scsi_build_sense_buffer(0, cmd->sense_buffer, DATA_PROTECT,
+					0x27, 0);
+		cmd->result = (DRIVER_SENSE << 24) | SAM_STAT_CHECK_CONDITION;
+		cmd->scsi_done(cmd);
+		return 0;
+	}
+#endif
 
 	/*
 	 * MTK PATCH
@@ -8164,6 +8204,9 @@ static int ufshcd_ioctl(struct scsi_device *dev, int cmd, void __user *buffer)
 {
 	struct ufs_hba *hba = shost_priv(dev->host);
 	int err = 0;
+
+	if (IS_ENABLED(CONFIG_TALIH_PASS2_BOOT_DIAG))
+		return -EROFS;
 
 	if (!buffer) {
 		dev_err(hba->dev, "%s: user buffer is NULL\n", __func__);
