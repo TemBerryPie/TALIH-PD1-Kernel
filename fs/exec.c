@@ -1736,8 +1736,8 @@ static int talih_pass2_read_init(struct linux_binprm *bprm, bool recovery)
 static bool talih_pass2_selinux_entered;
 
 #ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
-#define TALIH_PASS2_SECOND_OFFSET	0x14cc20UL
-#define TALIH_PASS2_SECOND_INSN		0xa9ba7bfdU
+#define TALIH_PASS2_SECOND_OFFSET	0x14e938UL
+#define TALIH_PASS2_SECOND_INSN		0x91232529U
 #define TALIH_PASS2_POLICY_SIZE		1327526
 
 static bool talih_pass2_policy_loaded;
@@ -1754,7 +1754,7 @@ void talih_pass2_note_policy_load(size_t size)
 
 static void talih_pass2_second_stop(struct callback_head *work)
 {
-	pr_emerg("TALIH_PASS2_DIAG: SecondStageMain reached, before RC\n");
+	pr_emerg("TALIH_PASS2_DIAG: RC parse returned, before first action\n");
 	talih_pass2_stop(0);
 }
 
@@ -1765,11 +1765,11 @@ static int talih_pass2_second_hit(struct uprobe_consumer *self,
 		return 0;
 	if (task_pid_nr(current) != 1 ||
 	    instruction_pointer(regs) != talih_pass2_second_pc)
-		panic("TALIH_PASS2_DIAG: unexpected SecondStageMain probe hit");
+		panic("TALIH_PASS2_DIAG: unexpected RC parse probe hit");
 
 	/* 离开 uprobe 锁后、返回用户态前执行重启。 */
 	if (task_work_add(current, &talih_pass2_second_work, true))
-		panic("TALIH_PASS2_DIAG: failed to queue SecondStageMain stop");
+		panic("TALIH_PASS2_DIAG: failed to queue RC parse stop");
 	return 0;
 }
 
@@ -1829,7 +1829,7 @@ static int talih_pass2_arm_second_stage(struct file *file)
 	if (access_process_vm(current, addr, &insn, sizeof(insn), 0) !=
 	    sizeof(insn) || le32_to_cpu(insn) != UPROBE_SWBP_INSN)
 		return -EIO;
-	pr_info("TALIH_PASS2_DIAG: SecondStageMain probe armed at file +0x%lx\n",
+	pr_info("TALIH_PASS2_DIAG: RC parse probe armed at file +0x%lx\n",
 		TALIH_PASS2_SECOND_OFFSET);
 	return 0;
 }
@@ -1973,7 +1973,7 @@ static int exec_binprm(struct linux_binprm *bprm)
 #ifdef CONFIG_TALIH_PASS2_SECOND_STAGE_DIAG
 			ret = talih_pass2_arm_second_stage(bprm->file);
 			if (ret) {
-				pr_emerg("TALIH_PASS2_DIAG: SecondStageMain probe not armed\n");
+				pr_emerg("TALIH_PASS2_DIAG: RC parse probe not armed\n");
 				talih_pass2_stop(ret);
 			}
 #else
