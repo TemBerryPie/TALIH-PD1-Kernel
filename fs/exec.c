@@ -1687,7 +1687,7 @@ EXPORT_SYMBOL(search_binary_handler);
 #ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
 static void __noreturn talih_pass2_stop(int err)
 {
-	pr_emerg("TALIH_PASS2_DIAG: handoff=%d; stopping before donor userspace\n",
+	pr_emerg("TALIH_PASS2_DIAG: handoff=%d; stopping at diagnostic boundary\n",
 		 err);
 	kernel_restart("bootloader");
 	panic("TALIH_PASS2_DIAG: restart returned");
@@ -1717,6 +1717,57 @@ static int talih_pass2_read_init(struct linux_binprm *bprm)
 }
 #endif
 
+#ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
+static bool talih_pass2_selinux_entered;
+
+static bool talih_pass2_match_args(struct linux_binprm *bprm,
+				  const char *args, size_t size)
+{
+	unsigned long pos = bprm->p;
+
+	if (bprm->argc != 2 || strcmp(bprm->filename, "/system/bin/init"))
+		return false;
+
+	/* 从已复制到新进程栈上的参数读取，不再访问原用户指针。 */
+	while (size) {
+		size_t offset = offset_in_page(pos);
+		size_t count = min(size, PAGE_SIZE - offset);
+		struct page *page = get_arg_page(bprm, pos, 0);
+		const char *addr;
+		bool match;
+
+		if (!page)
+			return false;
+		addr = kmap(page);
+		match = !memcmp(addr + offset, args, count);
+		kunmap(page);
+		put_arg_page(page);
+		if (!match)
+			return false;
+		pos += count;
+		args += count;
+		size -= count;
+	}
+	return true;
+}
+
+static void talih_pass2_check_selinux_stage(struct linux_binprm *bprm)
+{
+	static const char setup[] = "/system/bin/init\0selinux_setup";
+	static const char next[] = "/system/bin/init\0second_stage";
+
+	if (talih_pass2_selinux_entered) {
+		if (talih_pass2_match_args(bprm, next, sizeof(next)))
+			pr_emerg("TALIH_PASS2_DIAG: second_stage blocked before exec\n");
+		else
+			pr_emerg("TALIH_PASS2_DIAG: unexpected PID 1 exec blocked\n");
+		talih_pass2_stop(-ECANCELED);
+	}
+	if (!talih_pass2_match_args(bprm, setup, sizeof(setup)))
+		talih_pass2_stop(-EINVAL);
+}
+#endif
+
 static int exec_binprm(struct linux_binprm *bprm)
 {
 	pid_t old_pid, old_vpid;
@@ -1725,6 +1776,9 @@ static int exec_binprm(struct linux_binprm *bprm)
 	bool stop_before_userspace = task_pid_nr(current) == 1 && current->mm;
 
 	if (stop_before_userspace) {
+#ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
+		talih_pass2_check_selinux_stage(bprm);
+#endif
 		ret = talih_pass2_read_init(bprm);
 		if (ret)
 			talih_pass2_stop(ret);
@@ -1739,8 +1793,16 @@ static int exec_binprm(struct linux_binprm *bprm)
 
 	ret = search_binary_handler(bprm);
 #ifdef CONFIG_TALIH_PASS2_BOOT_DIAG
-	if (stop_before_userspace)
+	if (stop_before_userspace) {
+#ifdef CONFIG_TALIH_PASS2_SELINUX_DIAG
+		if (ret < 0)
+			talih_pass2_stop(ret);
+		talih_pass2_selinux_entered = true;
+		pr_info("TALIH_PASS2_DIAG: entering selinux_setup\n");
+#else
 		talih_pass2_stop(ret);
+#endif
+	}
 #endif
 	if (ret >= 0) {
 		audit_bprm(bprm);

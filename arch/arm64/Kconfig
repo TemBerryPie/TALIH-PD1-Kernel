@@ -1332,3 +1332,10 @@ config TALIH_PASS2_BOOT_DIAG
 	  只读访问 UFS。在 Android 第一阶段 init 尝试交棒时，
 	  校验 EROFS 上的供体 init 并停在其用户态入口前。
 	  此选项仅用于诊断镜像，不能用于正常启动。
+
+config TALIH_PASS2_SELINUX_DIAG
+	bool "TALIH-PD1 Pass 2 SELinux 加载诊断"
+	depends on TALIH_PASS2_BOOT_DIAG && SECURITY_SELINUX
+	help
+	  只放行供体 init 的 selinux_setup；在进入 second_stage 前停止。
+	  保留只读 UFS 防护，不执行 vendor 启动脚本。

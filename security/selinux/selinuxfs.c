@@ -582,6 +582,10 @@ out1:
 out:
 	mutex_unlock(&fsi->mutex);
 	vfree(data);
+	if (IS_ENABLED(CONFIG_TALIH_PASS2_SELINUX_DIAG) && length > 0 &&
+	    task_pid_nr(current) == 1)
+		pr_info("TALIH_PASS2_DIAG: PID 1 SELinux policy loaded, bytes=%zd\n",
+			length);
 	return length;
 }
 
